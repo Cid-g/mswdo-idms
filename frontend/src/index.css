@@ -1,0 +1,157 @@
+/* Fonts loaded via <link> in index.html for better performance */
+@import "tailwindcss";
+
+/* ── Design token registry (generates Tailwind utilities) ─────── */
+@theme {
+  /* Fonts */
+  --font-display: "DM Serif Display", Georgia, serif;
+  --font-serif:   "DM Serif Display", Georgia, serif;
+  --font-sans:    "DM Sans", system-ui, sans-serif;
+
+  /* Dept accent palettes — generates bg-pwd-*, text-pwd-*, etc. */
+  --color-pwd-50:  #eff6ff;
+  --color-pwd-100: #dbeafe;
+  --color-pwd-500: #1e40af;
+  --color-pwd-600: #1e3a8a;
+  --color-pwd-700: #1e3a8a;
+
+  --color-sp-50:   #fff1f2;
+  --color-sp-100:  #ffe4e6;
+  --color-sp-500:  #be123c;
+  --color-sp-600:  #9f1239;
+  --color-sp-700:  #881337;
+
+  --color-sc-50:   #fffbeb;
+  --color-sc-100:  #fef3c7;
+  --color-sc-500:  #b45309;
+  --color-sc-600:  #92400e;
+  --color-sc-700:  #78350f;
+
+  --color-sa-50:   #f8fafc;
+  --color-sa-100:  #f1f5f9;
+  --color-sa-500:  #475569;
+  --color-sa-600:  #334155;
+  --color-sa-700:  #1e293b;
+
+  /* Named semantic colors */
+  --color-surface:   #F7F8FA;
+  --color-surface-2: #EDEEF2;
+  --color-border:    #DDE1EA;
+  --color-muted:     #8B92A5;
+  --color-text-2:    #4B5468;
+  --color-text-1:    #1A1F2E;
+
+  --color-sidebar:   #0F1623;
+
+  --color-success:    #16A34A;
+  --color-success-bg: #DCFCE7;
+  --color-warning:    #D97706;
+  --color-warning-bg: #FEF3C7;
+  --color-danger:     #DC2626;
+  --color-danger-bg:  #FEE2E2;
+  --color-info:       #0369A1;
+  --color-info-bg:    #E0F2FE;
+
+  /* Custom animations */
+  --animate-fade-up:  fade-up 300ms ease-out both;
+  --animate-slide-in: slide-in-right 300ms ease-out both;
+  --animate-id-appear:id-appear 500ms cubic-bezier(0.175, 0.885, 0.32, 1.275) both;
+  --animate-modal-in: modal-in 200ms ease-out both;
+}
+
+/* ── Keyframes ────────────────────────────────────────────────── */
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+
+@keyframes slide-in-right {
+  from { opacity: 0; transform: translateX(20px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes id-appear {
+  from { opacity: 0; transform: translateY(30px) scale(0.97); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes modal-in {
+  from { opacity: 0; transform: scale(0.95) translateY(-8px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+/* ── CSS custom properties (non-Tailwind, used directly in CSS) ─ */
+:root {
+  /* Shadows */
+  --shadow-sm:   0 1px 3px rgba(15,22,35,0.07), 0 1px 2px rgba(15,22,35,0.05);
+  --shadow-md:   0 4px 12px rgba(15,22,35,0.08), 0 2px 4px rgba(15,22,35,0.04);
+  --shadow-lg:   0 10px 30px rgba(15,22,35,0.10), 0 4px 8px rgba(15,22,35,0.05);
+  --shadow-card: 0 0 0 1px #DDE1EA, 0 2px 8px rgba(15,22,35,0.06);
+
+  /* Sidebar */
+  --sidebar-bg:      #0F1623;
+  --sidebar-surface: #1A2236;
+  --sidebar-text:    #A8B4CC;
+  --sidebar-active:  #FFFFFF;
+
+  /* Motion */
+  --ease-standard:   cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-decelerate: cubic-bezier(0, 0, 0.2, 1);
+  --ease-spring:     cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+/* ── Base styles ─────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  background-color: #F7F8FA;
+  color: #1A1F2E;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Department class helpers (apply to body or layout root) ─── */
+.dept-pwd {
+  --dept-primary:  #1E40AF;
+  --dept-secondary:#3B82F6;
+  --dept-light:    #EFF6FF;
+  --dept-gradient: linear-gradient(135deg, #1E3A8A 0%, #1E40AF 60%, #2563EB 100%);
+  --dept-text:     #1E3A8A;
+}
+
+.dept-solo-parent {
+  --dept-primary:  #9F1239;
+  --dept-secondary:#E11D48;
+  --dept-light:    #FFF1F2;
+  --dept-gradient: linear-gradient(135deg, #881337 0%, #9F1239 60%, #BE123C 100%);
+  --dept-text:     #881337;
+}
+
+.dept-senior {
+  --dept-primary:  #92400E;
+  --dept-secondary:#D97706;
+  --dept-light:    #FFFBEB;
+  --dept-gradient: linear-gradient(135deg, #78350F 0%, #92400E 60%, #B45309 100%);
+  --dept-text:     #78350F;
+}
+
+.role-superadmin {
+  --dept-primary:  #334155;
+  --dept-secondary:#475569;
+  --dept-light:    #F1F5F9;
+  --dept-gradient: linear-gradient(135deg, #1E293B 0%, #334155 60%, #475569 100%);
+  --dept-text:     #1E293B;
+}
+
+/* ── Page enter animation ─────────────────────────────────────── */
+.page-enter {
+  animation: fade-up 300ms var(--ease-decelerate) both;
+}

@@ -1,0 +1,37 @@
+# Local AI/tooling configuration
+.agents/
+.claude/
+.codex/
+.superpowers/
+.playwright-mcp/
+
+# Agent instruction files used only during development
+AGENTS.md
+CLAUDE.md
+
+# Internal documentation excluded from the final submission
+docs/
+
+# Root-level screenshots, source templates, and reference images
+/*.png
+/*.jpg
+/*.jpeg
+/*.webp
+/*.gif
+/templates/
+
+# Test and browser automation output
+playwright-report/
+test-results/
+coverage/
+
+# Dependencies and build output
+node_modules/
+dist/
+build/
+
+# Common local files
+.DS_Store
+Thumbs.db
+*.log
+*.err

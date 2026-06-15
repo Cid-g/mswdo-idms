@@ -1,0 +1,442 @@
+const path = require('path');
+const fs   = require('fs');
+const { v4: uuidv4 } = require('uuid');
+
+const Applicant         = require('../models/Applicant');
+const IDRecord          = require('../models/IDRecord');
+const IDTemplate        = require('../models/IDTemplate');
+const IDTemplateVersion = require('../models/IDTemplateVersion');
+const { generateIDImage } = require('../services/idGeneration');
+const {
+  nextPWDIdNumber,
+  nextOSCANumber,
+  nextCaseNumber,
+  caseNumberToSPIC,
+} = require('../services/sequences');
+
+const IDS_DIR = path.resolve(__dirname, '../../uploads/ids');
+
+// Senior Citizen back is fully static text — no variable placeholders, no back generation
+const DEPT_HAS_BACK = { PWD: true, SOLO_PARENT: true, SENIOR_CITIZEN: false };
+
+// Staff/admin may only touch records in their own department. SUPERADMIN bypasses.
+function deptForbidden(req, record) {
+  return req.user.role !== 'SUPERADMIN' && record.department !== req.user.department;
+}
+
+function populateRecord(query) {
+  return query
+    .populate('reprintHistory.reprintedBy', 'firstName lastName')
+    .populate('releasedById',               'firstName lastName')
+    .populate('lastReprintById',            'firstName lastName')
+    .populate('revokedById',                'firstName lastName');
+}
+
+function computeExpiryDate(department) {
+  if (department === 'PWD') {
+    const d = new Date(); d.setFullYear(d.getFullYear() + 5); return d;
+  }
+  if (department === 'SOLO_PARENT') {
+    const d = new Date(); d.setFullYear(d.getFullYear() + 2); return d;
+  }
+  return null; // SENIOR_CITIZEN — no expiry
+}
+
+// ── POST /id-records ──────────────────────────────────────────────────────────
+async function createIDRecord(req, res, next) {
+  try {
+    const { applicantId } = req.body;
+    if (!applicantId) {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'applicantId is required.' } });
+    }
+
+    const applicant = await Applicant.findById(applicantId);
+    if (!applicant) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Applicant not found.' } });
+    }
+
+    if (req.user.role !== 'SUPERADMIN' && applicant.department !== req.user.department) {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Cannot generate ID for another department.' } });
+    }
+
+    if (!applicant.photoPath) {
+      return res.status(400).json({
+        error: { code: 'VALIDATION_ERROR', message: 'Applicant photo is required before generating an ID.' },
+      });
+    }
+
+    if (!applicant.signaturePath) {
+      return res.status(400).json({
+        error: { code: 'VALIDATION_ERROR', message: 'Applicant signature is required before generating an ID.' },
+      });
+    }
+
+    const existing = await IDRecord.findOne({ applicantId, status: 'ACTIVE' });
+    if (existing) {
+      return res.status(400).json({ error: { code: 'CONFLICT', message: 'An active ID already exists for this applicant.' } });
+    }
+
+    // ── Active template version (required) ────────────────────────────────────
+    const template = await IDTemplate.findOne({ department: applicant.department });
+    const activeVersion = template?.activeVersionId
+      ? await IDTemplateVersion.findById(template.activeVersionId)
+      : null;
+    if (!activeVersion || !activeVersion.front?.imagePath) {
+      return res.status(400).json({
+        error: { code: 'VALIDATION_ERROR', message: 'No active front template for this department. Please upload and configure a front template first.' },
+      });
+    }
+    if (!activeVersion.front.placeholderConfig || Object.keys(activeVersion.front.placeholderConfig).length === 0) {
+      return res.status(400).json({
+        error: { code: 'VALIDATION_ERROR', message: 'Front template placeholders are not configured. Please configure the front template first.' },
+      });
+    }
+    const frontTemplate = {
+      templateImagePath: activeVersion.front.imagePath,
+      placeholderConfig: activeVersion.front.placeholderConfig,
+    };
+
+    // ── ID number ─────────────────────────────────────────────────────────────
+    let idNumber;
+    if (applicant.department === 'PWD') {
+      idNumber = await nextPWDIdNumber();
+    } else if (applicant.department === 'SENIOR_CITIZEN') {
+      idNumber = applicant.seniorCitizen?.oscaNumber;
+      if (!idNumber) {
+        idNumber = await nextOSCANumber();
+        if (!applicant.seniorCitizen) applicant.seniorCitizen = {};
+        applicant.seniorCitizen.oscaNumber = idNumber;
+        applicant.markModified('seniorCitizen');
+        await applicant.save();
+      }
+    } else {
+      idNumber = applicant.soloParent?.spicNumber;
+      if (!idNumber) {
+        const caseNum = applicant.soloParent?.caseNumber || await nextCaseNumber();
+        idNumber = caseNumberToSPIC(caseNum);
+        if (!applicant.soloParent) applicant.soloParent = {};
+        if (!applicant.soloParent.caseNumber) applicant.soloParent.caseNumber = caseNum;
+        applicant.soloParent.spicNumber = idNumber;
+        applicant.markModified('soloParent');
+        await applicant.save();
+      }
+    }
+
+    const qrToken    = uuidv4();
+    const issuedDate = new Date();
+    const expiryDate = computeExpiryDate(applicant.department);
+    const idData     = { idNumber, qrToken, issuedDate, expiryDate };
+
+    fs.mkdirSync(IDS_DIR, { recursive: true });
+
+    // ── Generate front ────────────────────────────────────────────────────────
+    const { buffer: frontBuf, filename: frontFile } = await generateIDImage(applicant, idData, frontTemplate);
+    const idImagePath = path.join(IDS_DIR, frontFile);
+    fs.writeFileSync(idImagePath, frontBuf);
+
+    // ── Generate back (optional) ──────────────────────────────────────────────
+    let idImageBackPath = null;
+    if (DEPT_HAS_BACK[applicant.department] && activeVersion.back?.imagePath
+        && Object.keys(activeVersion.back.placeholderConfig || {}).length > 0) {
+      const backTemplate = {
+        templateImagePath: activeVersion.back.imagePath,
+        placeholderConfig: activeVersion.back.placeholderConfig,
+      };
+      try {
+        const { buffer: backBuf, filename: backFile } = await generateIDImage(applicant, idData, backTemplate);
+        idImageBackPath = path.join(IDS_DIR, backFile);
+        fs.writeFileSync(idImageBackPath, backBuf);
+      } catch (err) {
+        console.warn('[idRecord] Back-side generation failed (non-fatal):', err.message);
+      }
+    }
+
+    // ── Persist ───────────────────────────────────────────────────────────────
+    const idRecord = await IDRecord.create({
+      applicantId,
+      department:        applicant.department,
+      idNumber,
+      qrToken,
+      issuedDate,
+      expiryDate,
+      status:            'ACTIVE',
+      idImagePath,
+      idImageBackPath,
+      templateVersionId: activeVersion._id,
+    });
+
+    // If the applicant profile is already COMPLETE (profile finished BEFORE the ID was
+    // generated), anchor immediately — otherwise the PARTIAL→COMPLETE auto-anchor never
+    // fires for this record. Non-fatal and idempotent (skips if already anchored).
+    if (applicant.status === 'COMPLETE' && process.env.FABRIC_ENABLED === 'true') {
+      const BlockchainAnchor = require('../models/BlockchainAnchor');
+      const { anchorIDOnChain } = require('../services/blockchain');
+      BlockchainAnchor.findOne({ idRecordId: idRecord._id })
+        .then((existing) => { if (!existing) return anchorIDOnChain(applicant, idRecord); })
+        .catch((err) => console.error('[Blockchain] Anchor-on-create failed:', err.message));
+    }
+
+    const obj = idRecord.toObject();
+    obj.idImageUrl     = `/api/id-records/${idRecord._id}/image`;
+    obj.idImageBackUrl = idImageBackPath ? `/api/id-records/${idRecord._id}/image/back` : null;
+    return res.status(201).json(obj);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── GET /id-records?applicantId=xxx ───────────────────────────────────────────
+async function listIDRecords(req, res, next) {
+  try {
+    const { applicantId } = req.query;
+    if (!applicantId) {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'applicantId query param is required.' } });
+    }
+    const record = await populateRecord(IDRecord.findOne({ applicantId }).sort({ createdAt: -1 }));
+    if (!record) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'No ID record found for this applicant.' } });
+    }
+    if (deptForbidden(req, record)) {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Access denied.' } });
+    }
+    return res.json(toResponse(record));
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── GET /id-records/:id ───────────────────────────────────────────────────────
+async function getIDRecordById(req, res, next) {
+  try {
+    const record = await populateRecord(IDRecord.findById(req.params.id));
+    if (!record) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'ID record not found.' } });
+    }
+    if (deptForbidden(req, record)) {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Access denied.' } });
+    }
+    return res.json(toResponse(record));
+  } catch (err) {
+    next(err);
+  }
+}
+
+function toResponse(record) {
+  const obj = record.toObject();
+  obj.idImageUrl     = `/api/id-records/${record._id}/image`;
+  obj.idImageBackUrl = record.idImageBackPath ? `/api/id-records/${record._id}/image/back` : null;
+  return obj;
+}
+
+// ── GET /id-records/:id/image (front) ────────────────────────────────────────
+async function getIDImage(req, res, next) {
+  try {
+    const record = await IDRecord.findById(req.params.id);
+    if (!record) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'ID record not found.' } });
+    }
+    if (deptForbidden(req, record)) {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Access denied.' } });
+    }
+    if (!record.idImagePath || !fs.existsSync(record.idImagePath)) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Front ID image not found.' } });
+    }
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    fs.createReadStream(record.idImagePath).pipe(res);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── GET /id-records/:id/image/back ───────────────────────────────────────────
+async function getIDBackImage(req, res, next) {
+  try {
+    const record = await IDRecord.findById(req.params.id);
+    if (!record) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'ID record not found.' } });
+    }
+    if (deptForbidden(req, record)) {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Access denied.' } });
+    }
+    if (!record.idImageBackPath || !fs.existsSync(record.idImageBackPath)) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Back ID image not found.' } });
+    }
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    fs.createReadStream(record.idImageBackPath).pipe(res);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /id-records/:id/release ─────────────────────────────────────────────
+async function releaseIDRecord(req, res, next) {
+  try {
+    const record = await IDRecord.findById(req.params.id);
+    if (!record) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'ID record not found.' } });
+    if (deptForbidden(req, record)) {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Access denied.' } });
+    }
+    record.releasedAt   = new Date();
+    record.releasedById = req.user.id;
+    await record.save();
+    const populated = await populateRecord(IDRecord.findById(record._id));
+    return res.json(toResponse(populated));
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /id-records/:id/reprint ─────────────────────────────────────────────
+async function reprintIDRecord(req, res, next) {
+  try {
+    const record = await IDRecord.findById(req.params.id);
+    if (!record) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'ID record not found.' } });
+    if (deptForbidden(req, record)) {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Access denied.' } });
+    }
+    const now = new Date();
+    record.reprintHistory.push({
+      reprintedBy: req.user.id,
+      reprintedAt: now,
+      reason:      req.body.reason || undefined,
+    });
+    record.reprintCount    = (record.reprintCount || 0) + 1;
+    record.lastReprintAt   = now;
+    record.lastReprintById = req.user.id;
+    await record.save();
+    const populated = await populateRecord(IDRecord.findById(record._id));
+    return res.json(toResponse(populated));
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /id-records/:id/revoke ───────────────────────────────────────────────
+async function revokeIDRecord(req, res, next) {
+  try {
+    const { reason } = req.body;
+    if (!reason || !reason.trim()) {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'A revocation reason is required.' } });
+    }
+
+    const record = await IDRecord.findById(req.params.id);
+    if (!record) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'ID record not found.' } });
+
+    if (record.status === 'REVOKED') {
+      return res.status(400).json({ error: { code: 'CONFLICT', message: 'This ID is already revoked.' } });
+    }
+
+    if (req.user.role !== 'SUPERADMIN' && record.department !== req.user.department) {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Cannot revoke an ID from another department.' } });
+    }
+
+    record.status        = 'REVOKED';
+    record.revokedReason = reason.trim();
+    record.revokedAt     = new Date();
+    record.revokedById   = req.user.id;
+    await record.save();
+
+    // Revoke on-chain (non-fatal)
+    if (process.env.FABRIC_ENABLED === 'true') {
+      const { revokeIDOnChain } = require('../services/blockchain');
+      revokeIDOnChain(record.idNumber, reason.trim())
+        .catch((err) => console.error('[Blockchain] On-chain revoke failed:', err.message));
+    }
+
+    return res.json(toResponse(record));
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── GET /id-records/print-queue ───────────────────────────────────────────────
+// Returns all ACTIVE ID records for the user's department, with applicant info.
+async function getPrintQueue(req, res, next) {
+  try {
+    const filter = { status: 'ACTIVE' };
+    if (req.user.role !== 'SUPERADMIN') {
+      filter.department = req.user.department;
+    } else if (req.query.department) {
+      filter.department = req.query.department;
+    }
+
+    const records = await IDRecord
+      .find(filter)
+      .sort({ createdAt: -1 })
+      .populate('applicantId', 'firstName lastName middleName');
+
+    return res.json(records.map((r) => ({
+      _id:           r._id,
+      idNumber:      r.idNumber,
+      department:    r.department,
+      issuedDate:    r.issuedDate,
+      releasedAt:    r.releasedAt    ?? null,
+      printCount:    r.printCount    ?? 0,
+      lastPrintedAt: r.lastPrintedAt ?? null,
+      hasBack:       Boolean(r.idImageBackPath),
+      applicant:     r.applicantId
+        ? { _id: r.applicantId._id, firstName: r.applicantId.firstName, lastName: r.applicantId.lastName, middleName: r.applicantId.middleName }
+        : null,
+    })));
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /id-records/batch-log-print ─────────────────────────────────────────
+// Called automatically when staff clicks Print. Increments printCount + sets lastPrintedAt.
+async function batchLogPrint(req, res, next) {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'ids array is required.' } });
+    }
+    const filter = { _id: { $in: ids }, status: 'ACTIVE' };
+    if (req.user.role !== 'SUPERADMIN') filter.department = req.user.department;
+    await IDRecord.updateMany(filter, {
+      $set: { lastPrintedAt: new Date() },
+      $inc: { printCount: 1 },
+    });
+    return res.json({ logged: ids.length });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /id-records/batch-release ────────────────────────────────────────────
+// Bulk-release a list of ID records by their IDs.
+async function batchReleaseIDRecords(req, res, next) {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'ids array is required.' } });
+    }
+
+    const filter = { _id: { $in: ids }, status: 'ACTIVE', releasedAt: { $exists: false } };
+    if (req.user.role !== 'SUPERADMIN') filter.department = req.user.department;
+
+    const result = await IDRecord.updateMany(filter, {
+      $set: { releasedAt: new Date(), releasedById: req.user.id },
+    });
+
+    return res.json({ released: result.modifiedCount });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = {
+  createIDRecord,
+  listIDRecords,
+  getIDRecordById,
+  getIDImage,
+  getIDBackImage,
+  releaseIDRecord,
+  reprintIDRecord,
+  revokeIDRecord,
+  getPrintQueue,
+  batchLogPrint,
+  batchReleaseIDRecords,
+};

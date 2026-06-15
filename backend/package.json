@@ -1,0 +1,43 @@
+{
+  "name": "mswdo-idms-backend",
+  "version": "1.0.0",
+  "description": "MSWDO ID Management System — Backend API",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "nodemon src/server.js",
+    "start": "node src/server.js",
+    "seed": "node scripts/seed.js",
+    "test": "jest --runInBand --forceExit",
+    "test:unit": "jest tests/unit --runInBand --forceExit",
+    "test:integration": "jest tests/integration --runInBand --forceExit",
+    "test:security": "jest tests/security --runInBand --forceExit",
+    "test:coverage": "jest --runInBand --forceExit --coverage"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.4",
+    "@hyperledger/fabric-gateway": "^1.11.0",
+    "@imgly/background-removal-node": "^1.4.5",
+    "@napi-rs/canvas": "^1.0.0",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
+    "express": "^4.18.3",
+    "express-rate-limit": "^7.2.0",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.3.0",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1",
+    "qrcode": "^1.5.4",
+    "sharp": "^0.33.3",
+    "uuid": "^9.0.1",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "mongodb-memory-server": "^10.1.2",
+    "nodemon": "^3.1.0",
+    "supertest": "^7.0.0"
+  }
+}

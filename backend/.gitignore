@@ -1,0 +1,16 @@
+node_modules/
+backup*/
+dump/
+*login.json
+uploads/photos/*
+uploads/signatures/*
+uploads/templates/*
+uploads/id-cards/*
+uploads/avatars/*
+uploads/ids/*
+!uploads/photos/.gitkeep
+!uploads/signatures/.gitkeep
+!uploads/templates/.gitkeep
+!uploads/id-cards/.gitkeep
+!uploads/avatars/.gitkeep
+!uploads/ids/.gitkeep
