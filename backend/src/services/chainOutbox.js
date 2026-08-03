@@ -186,6 +186,17 @@ async function failOperation(outbox, { owner, now, error }) {
   return result.modifiedCount === 1;
 }
 
+async function releaseOperation(outbox, { owner, now }) {
+  const result = await ChainOutbox.updateOne(
+    { _id: outbox._id, state: 'PROCESSING', lockOwner: owner },
+    {
+      $set: { state: 'PENDING', nextAttempt: now },
+      $unset: { lockOwner: '', lockedUntil: '' },
+    }
+  );
+  return result.modifiedCount === 1;
+}
+
 async function completeOperation(outbox, { owner, now, receipt }) {
   return withMongoTransaction(async (session) => {
     if (outbox.operation === 'ANCHOR') {
@@ -241,5 +252,6 @@ module.exports = {
   failOperation,
   operationIdFor,
   recoverExpiredLeases,
+  releaseOperation,
   reevaluateBlockedOperations,
 };

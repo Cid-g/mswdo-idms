@@ -654,6 +654,71 @@ describe('leased and ordered chain outbox execution', () => {
   });
 
   test.each([
+    ['disabled race', 'FABRIC_DISABLED', undefined],
+    ['superseded connection', 'FABRIC_CONNECTION_SUPERSEDED', undefined],
+    ['numeric unavailable', 14, undefined],
+    ['numeric deadline', 4, undefined],
+    ['string unavailable', 'UNAVAILABLE', undefined],
+    ['string deadline', 'DEADLINE_EXCEEDED', undefined],
+    ['wrapped unavailable', 'CHAIN_RECEIPT_RECOVERY_FAILED', 14],
+  ])('releases a claimed command without consuming attempts after %s', async (
+    _label,
+    code,
+    causeCode
+  ) => {
+    const settleTime = new Date('2026-08-03T08:07:00.000Z');
+    const queued = await queueOperation({ attempts: 7, nextAttempt: now });
+    const execution = deferred();
+    const client = fabricClient({ executeChainCommand: jest.fn(() => execution.promise) });
+
+    const run = runChainOutboxOnce({
+      owner: 'transport-worker',
+      now,
+      clock: () => settleTime,
+      fabricClient: client,
+    });
+    await waitForCall(client.executeChainCommand);
+    const error = Object.assign(new Error('Fabric infrastructure changed'), { code });
+    if (causeCode !== undefined) {
+      error.cause = Object.assign(new Error('wrapped transport failure'), { code: causeCode });
+    }
+    execution.reject(error);
+    await run;
+
+    const persisted = await ChainOutbox.findById(queued._id).lean();
+    expect(persisted).toMatchObject({
+      state: 'PENDING',
+      attempts: 7,
+      nextAttempt: settleTime,
+    });
+    expect(persisted.lockOwner).toBeUndefined();
+    expect(persisted.lockedUntil).toBeUndefined();
+  });
+
+  test('uses settlement time, not claim time, to schedule a slow business failure', async () => {
+    const settleTime = new Date('2026-08-03T08:11:00.000Z');
+    const queued = await queueOperation({ nextAttempt: now });
+    const execution = deferred();
+    const client = fabricClient({ executeChainCommand: jest.fn(() => execution.promise) });
+
+    const run = runChainOutboxOnce({
+      owner: 'slow-failure-worker',
+      now,
+      clock: () => settleTime,
+      fabricClient: client,
+    });
+    await waitForCall(client.executeChainCommand);
+    execution.reject(new Error('deterministic endorsement conflict'));
+    await run;
+
+    expect(await ChainOutbox.findById(queued._id).lean()).toMatchObject({
+      state: 'PENDING',
+      attempts: 1,
+      nextAttempt: new Date(settleTime.getTime() + 30_000),
+    });
+  });
+
+  test.each([
     [0, 30_000],
     [1, 60_000],
     [2, 5 * 60_000],
@@ -672,7 +737,9 @@ describe('leased and ordered chain outbox execution', () => {
       executeChainCommand: jest.fn().mockRejectedValue(conflict),
     });
 
-    await runChainOutboxOnce({ owner: 'retry-worker', now, fabricClient: client });
+    await runChainOutboxOnce({
+      owner: 'retry-worker', now, clock: () => now, fabricClient: client,
+    });
 
     const persisted = await ChainOutbox.findById(queued._id).lean();
     expect(persisted).toMatchObject({ state: 'PENDING', attempts: attempts + 1 });
@@ -694,7 +761,9 @@ describe('leased and ordered chain outbox execution', () => {
         executeChainCommand: jest.fn().mockRejectedValue(new Error('command rejected')),
       });
 
-      await runChainOutboxOnce({ owner: 'terminal-worker', now, fabricClient: client });
+      await runChainOutboxOnce({
+        owner: 'terminal-worker', now, clock: () => now, fabricClient: client,
+      });
 
       expect(await ChainOutbox.findById(queued._id).lean()).toMatchObject({
         state: 'FAILED',
@@ -715,14 +784,21 @@ describe('leased and ordered chain outbox execution', () => {
       executeChainCommand: jest.fn().mockRejectedValue(new Error('endorsement rejected')),
     });
 
-    await runChainOutboxOnce({ owner: 'revoke-worker', now, fabricClient: client });
+    await runChainOutboxOnce({
+      owner: 'revoke-worker', now, clock: () => now, fabricClient: client,
+    });
     const afterTwenty = await ChainOutbox.findById(queued._id).lean();
     expect(afterTwenty).toMatchObject({ state: 'PENDING', attempts: 20 });
     expect(afterTwenty.alertedAt).toEqual(now);
     expect(afterTwenty.nextAttempt).toEqual(new Date(now.getTime() + 60 * 60_000));
 
     const nextRun = new Date(now.getTime() + 60 * 60_000);
-    await runChainOutboxOnce({ owner: 'revoke-worker', now: nextRun, fabricClient: client });
+    await runChainOutboxOnce({
+      owner: 'revoke-worker',
+      now: nextRun,
+      clock: () => nextRun,
+      fabricClient: client,
+    });
     const afterTwentyOne = await ChainOutbox.findById(queued._id).lean();
     expect(afterTwentyOne).toMatchObject({ state: 'PENDING', attempts: 21 });
     expect(afterTwentyOne.alertedAt).toEqual(now);
@@ -748,7 +824,9 @@ describe('leased and ordered chain outbox execution', () => {
         }),
       });
 
-      await runChainOutboxOnce({ owner: 'anchor-worker', now, fabricClient: client });
+      await runChainOutboxOnce({
+        owner: 'anchor-worker', now, clock: () => now, fabricClient: client,
+      });
 
       const [outbox, anchor] = await Promise.all([
         ChainOutbox.findById(queued._id).lean(),
@@ -777,6 +855,41 @@ describe('leased and ordered chain outbox execution', () => {
       else expect(anchor.reconciledAt).toBeUndefined();
     }
   );
+
+  test('persists anchoredAt and completedAt from a fresh post-Fabric settlement time', async () => {
+    const settleTime = new Date('2026-08-03T08:13:00.000Z');
+    const idRecordId = new mongoose.Types.ObjectId();
+    const queued = await queueOperation({
+      idRecordId,
+      recordRef: 'PWD-SLOW-ANCHOR',
+      nextAttempt: now,
+    });
+    const execution = deferred();
+    const client = fabricClient({ executeChainCommand: jest.fn(() => execution.promise) });
+    const clock = jest.fn(() => settleTime);
+
+    const run = runChainOutboxOnce({
+      owner: 'slow-anchor-worker', now, clock, fabricClient: client,
+    });
+    await waitForCall(client.executeChainCommand);
+    expect(clock).not.toHaveBeenCalled();
+    execution.resolve({
+      txId: 'tx-slow-anchor',
+      blockNumber: 101,
+      ledgerEpoch: 'slow-anchor-epoch',
+      reconciled: true,
+    });
+    await run;
+
+    const [outbox, anchor] = await Promise.all([
+      ChainOutbox.findById(queued._id).lean(),
+      BlockchainAnchor.findOne({ idRecordId }).lean(),
+    ]);
+    expect(clock).toHaveBeenCalledTimes(1);
+    expect(outbox.completedAt).toEqual(settleTime);
+    expect(anchor.anchoredAt).toEqual(settleTime);
+    expect(anchor.reconciledAt).toEqual(settleTime);
+  });
 
   test('rolls back the ANCHOR update when the guarded SENT transition cannot commit', async () => {
     const idRecordId = new mongoose.Types.ObjectId();

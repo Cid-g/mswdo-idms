@@ -681,7 +681,11 @@ describe('immutable Fabric command execution', () => {
 });
 
 describe('chain outbox worker timer lifecycle', () => {
-  function loadWorker({ executeChainCommand = jest.fn().mockResolvedValue({}) } = {}) {
+  function loadWorker({
+    executeChainCommand = jest.fn().mockResolvedValue({}),
+    chainOutboxOverrides = {},
+    ensureFabricConnected = jest.fn().mockResolvedValue({ available: true }),
+  } = {}) {
     const claimed = {
       _id: 'outbox-id',
       operationId: 'anchor:outbox-id',
@@ -697,9 +701,11 @@ describe('chain outbox worker timer lifecycle', () => {
         .mockResolvedValue(null),
       completeOperation: jest.fn().mockResolvedValue(true),
       failOperation: jest.fn().mockResolvedValue(true),
+      releaseOperation: jest.fn().mockResolvedValue(true),
+      ...chainOutboxOverrides,
     };
     const fabricClient = {
-      ensureFabricConnected: jest.fn().mockResolvedValue({ available: true }),
+      ensureFabricConnected,
       executeChainCommand,
     };
 
@@ -768,5 +774,56 @@ describe('chain outbox worker timer lifecycle', () => {
 
     await jest.advanceTimersByTimeAsync(500);
     expect(fabricClient.ensureFabricConnected).toHaveBeenCalledTimes(1);
+  });
+
+  test('reports a PERSISTENCE_FAILED result while containing the background tick', async () => {
+    const persistenceError = new Error('transaction commit result is ambiguous');
+    const reporter = jest.fn();
+    const { worker } = loadWorker({
+      chainOutboxOverrides: {
+        completeOperation: jest.fn().mockRejectedValue(persistenceError),
+      },
+    });
+
+    worker.startChainOutboxWorker({ intervalMs: 100, errorReporter: reporter });
+    await jest.advanceTimersByTimeAsync(100);
+
+    expect(reporter).toHaveBeenCalledWith(
+      persistenceError,
+      expect.objectContaining({ state: 'PERSISTENCE_FAILED' })
+    );
+    await expect(worker.stopChainOutboxWorker()).resolves.toBeUndefined();
+  });
+
+  test('reports an unexpected rejected tick without creating an unhandled rejection', async () => {
+    const databaseError = new Error('Mongo unavailable during lease recovery');
+    const reporter = jest.fn();
+    const { worker } = loadWorker({
+      chainOutboxOverrides: {
+        recoverExpiredLeases: jest.fn().mockRejectedValue(databaseError),
+      },
+    });
+
+    worker.startChainOutboxWorker({ intervalMs: 100, errorReporter: reporter });
+    await jest.advanceTimersByTimeAsync(100);
+
+    expect(reporter).toHaveBeenCalledWith(
+      databaseError,
+      expect.objectContaining({ state: 'TICK_REJECTED' })
+    );
+    await expect(worker.stopChainOutboxWorker()).resolves.toBeUndefined();
+  });
+
+  test('does not report an expected retry outcome as a scheduler failure', async () => {
+    const reporter = jest.fn();
+    const { worker } = loadWorker({
+      executeChainCommand: jest.fn().mockRejectedValue(new Error('chaincode conflict')),
+    });
+
+    worker.startChainOutboxWorker({ intervalMs: 100, errorReporter: reporter });
+    await jest.advanceTimersByTimeAsync(100);
+
+    expect(reporter).not.toHaveBeenCalled();
+    await expect(worker.stopChainOutboxWorker()).resolves.toBeUndefined();
   });
 });
