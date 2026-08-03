@@ -30,6 +30,7 @@ const IDRecordSchema = new Schema(
     releasedAt:         Date,
     releasedById:       { type: Schema.Types.ObjectId, ref: 'User' },
     blockchainAnchorId: { type: Schema.Types.ObjectId, ref: 'BlockchainAnchor' },
+    chainSequence:      { type: Number, default: 0 },
   },
   { timestamps: true }
 );

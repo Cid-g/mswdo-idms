@@ -8,6 +8,9 @@ const BlockchainAnchorSchema = new Schema(
     canonicalHash:   String, // SHA-256
     txId:            String, // Hyperledger Fabric transaction ID
     blockNumber:     Number,
+    ledgerEpoch:     String,
+    receiptState:    { type: String, enum: ['CURRENT', 'STALE'], default: 'CURRENT' },
+    reconciledAt:    Date,
     anchoredAt:      { type: Date, default: Date.now },
     lastCheckedAt:   Date,
     lastCheckPassed: Boolean,
