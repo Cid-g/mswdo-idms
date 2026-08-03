@@ -2,6 +2,13 @@
 
 const { Contract } = require('fabric-contract-api');
 
+function transactionTime(ctx) {
+  const timestamp = ctx.stub.getTxTimestamp();
+  const seconds = BigInt(timestamp.seconds.toString());
+  const millis = seconds * 1000n + BigInt(Math.floor(timestamp.nanos / 1_000_000));
+  return new Date(Number(millis)).toISOString();
+}
+
 class IDContract extends Contract {
 
   async issueID(ctx, recordRef, idType, soloParentIdType, hash, issuingOffice) {
@@ -10,6 +17,7 @@ class IDContract extends Contract {
       throw new Error(`ID record ${recordRef} already exists on chain`);
     }
 
+    const now = transactionTime(ctx);
     const record = {
       recordRef,
       idType,
@@ -17,8 +25,8 @@ class IDContract extends Contract {
       hash,
       status: 'ACTIVE',
       issuingOffice,
-      issuedAt: new Date().toISOString(),
-      lastUpdatedAt: new Date().toISOString(),
+      issuedAt: now,
+      lastUpdatedAt: now,
     };
 
     await ctx.stub.putState(recordRef, Buffer.from(JSON.stringify(record)));
@@ -41,10 +49,11 @@ class IDContract extends Contract {
     }
 
     const record = JSON.parse(data.toString());
+    const now = transactionTime(ctx);
     record.status = 'REVOKED';
-    record.revokedAt = new Date().toISOString();
+    record.revokedAt = now;
     record.revokedReason = reason;
-    record.lastUpdatedAt = new Date().toISOString();
+    record.lastUpdatedAt = now;
 
     await ctx.stub.putState(recordRef, Buffer.from(JSON.stringify(record)));
     ctx.stub.setEvent('IDRevoked', Buffer.from(JSON.stringify({ recordRef, reason })));
@@ -78,9 +87,10 @@ class IDContract extends Contract {
     if (record.status === 'REVOKED') {
       throw new Error('Cannot expire a revoked record');
     }
+    const now = transactionTime(ctx);
     record.status = 'EXPIRED';
-    record.expiredAt = new Date().toISOString();
-    record.lastUpdatedAt = new Date().toISOString();
+    record.expiredAt = now;
+    record.lastUpdatedAt = now;
     await ctx.stub.putState(recordRef, Buffer.from(JSON.stringify(record)));
     return JSON.stringify(record);
   }

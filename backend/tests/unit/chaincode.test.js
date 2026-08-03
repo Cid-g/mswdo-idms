@@ -7,6 +7,7 @@ const IDContract = require('../../../blockchain/chaincode/id-contract');
 function makeMockCtx() {
   const store  = {};
   const events = [];
+  const txTime = '2026-08-03T12:34:56.789Z';
 
   const stub = {
     getState: jest.fn(async (key) => {
@@ -26,6 +27,10 @@ function makeMockCtx() {
         close: jest.fn(async () => {}),
       };
     }),
+    getTxTimestamp: jest.fn(() => ({
+      seconds: { toString: () => String(Math.floor(Date.parse(txTime) / 1000)) },
+      nanos: 789000000,
+    })),
   };
 
   return { stub, _store: store, _events: events };
@@ -48,6 +53,8 @@ describe('IDContract — issueID', () => {
     expect(result.status).toBe('ACTIVE');
     expect(result.hash).toBe('abc123hash');
     expect(result.issuingOffice).toBe('MSWDO-GERONA');
+    expect(result.issuedAt).toBe('2026-08-03T12:34:56.789Z');
+    expect(result.lastUpdatedAt).toBe('2026-08-03T12:34:56.789Z');
     expect(ctx.stub.putState).toHaveBeenCalledTimes(1);
     expect(ctx._events).toHaveLength(1);
     expect(ctx._events[0].name).toBe('IDIssued');
@@ -101,7 +108,8 @@ describe('IDContract — revokeID', () => {
     );
     expect(result.status).toBe('REVOKED');
     expect(result.revokedReason).toBe('Lost card reported');
-    expect(result.revokedAt).toBeTruthy();
+    expect(result.revokedAt).toBe('2026-08-03T12:34:56.789Z');
+    expect(result.lastUpdatedAt).toBe('2026-08-03T12:34:56.789Z');
     expect(ctx._events[0].name).toBe('IDRevoked');
   });
 
@@ -124,7 +132,8 @@ describe('IDContract — expireID', () => {
 
     const result = JSON.parse(await contract.expireID(ctx, 'PWD-2026-0001'));
     expect(result.status).toBe('EXPIRED');
-    expect(result.expiredAt).toBeTruthy();
+    expect(result.expiredAt).toBe('2026-08-03T12:34:56.789Z');
+    expect(result.lastUpdatedAt).toBe('2026-08-03T12:34:56.789Z');
   });
 
   test('throws if record does not exist', async () => {
