@@ -51,6 +51,10 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+function grpcError(code, message) {
+  return Object.assign(new Error(message), { code });
+}
+
 function anchorCommand(overrides = {}) {
   return {
     operationId: 'anchor:507f1f77bcf86cd799439011',
@@ -170,6 +174,7 @@ describe('reconnecting Fabric access', () => {
     } catch (_) {
       // A disabled test may not have loaded a connection.
     }
+    jest.useRealTimers();
     process.env = originalEnv;
   });
 
@@ -214,6 +219,90 @@ describe('reconnecting Fabric access', () => {
     await expect(fabric.ensureFabricConnected()).resolves.toEqual({ available: true });
     expect(fabricGateway.connect).toHaveBeenCalledTimes(2);
     expect(fabric.isFabricConnected()).toBe(true);
+  });
+
+  test('closes a locally constructed client when identity loading fails', async () => {
+    const boundary = installGateway();
+    fs.readFileSync.mockImplementation((path) => (
+      path === 'key.pem' ? Buffer.from('not a private key') : Buffer.from('certificate')
+    ));
+    const fabric = require('../../src/fabric/connect');
+
+    await expect(fabric.ensureFabricConnected()).rejects.toThrow();
+    expect(boundary.client.close).toHaveBeenCalledTimes(1);
+    expect(fabric.isFabricConnected()).toBe(false);
+  });
+
+  test('invalidates and replaces an attempt disconnected during its health probe', async () => {
+    const firstHealth = deferred();
+    const firstGateway = installGateway({
+      verify: (recordRef) => (recordRef === '__health__'
+        ? firstHealth.promise
+        : Promise.resolve({ found: false, recordRef })),
+    });
+    const { fabric } = loadModules();
+
+    const firstAttempt = fabric.ensureFabricConnected();
+    await Promise.resolve();
+    fabric.disconnectFromFabric();
+
+    const secondGateway = installGateway();
+    const secondAttempt = fabric.ensureFabricConnected();
+    firstHealth.resolve({ found: false, recordRef: '__health__' });
+    await expect(secondAttempt).resolves.toEqual({ available: true });
+
+    await expect(firstAttempt).rejects.toMatchObject({
+      code: 'FABRIC_CONNECTION_SUPERSEDED',
+    });
+    expect(fabricGateway.connect).toHaveBeenCalledTimes(2);
+    expect(firstGateway.gateway.close).toHaveBeenCalledTimes(1);
+    expect(firstGateway.client.close).toHaveBeenCalledTimes(1);
+    expect(secondGateway.gateway.close).not.toHaveBeenCalled();
+    expect(fabric.isFabricConnected()).toBe(true);
+  });
+
+  test('serializes reconnects behind a bounded infrastructure backoff', async () => {
+    jest.useFakeTimers();
+    installGateway({
+      verify: async () => { throw grpcError(grpc.status.UNAVAILABLE, 'peer unavailable'); },
+    });
+    const fabric = require('../../src/fabric/connect');
+
+    await expect(fabric.ensureFabricConnected()).rejects.toThrow('peer unavailable');
+    installGateway();
+    const firstReconnect = fabric.ensureFabricConnected();
+    const concurrentReconnect = fabric.ensureFabricConnected();
+
+    await jest.advanceTimersByTimeAsync(249);
+    expect(fabricGateway.connect).toHaveBeenCalledTimes(1);
+    await jest.advanceTimersByTimeAsync(1);
+    await expect(Promise.all([firstReconnect, concurrentReconnect])).resolves.toEqual([
+      { available: true },
+      { available: true },
+    ]);
+    expect(fabricGateway.connect).toHaveBeenCalledTimes(2);
+  });
+
+  test('caps consecutive reconnect backoff at five seconds', async () => {
+    jest.useFakeTimers();
+    const fabric = require('../../src/fabric/connect');
+    const failConnection = () => installGateway({
+      verify: async () => { throw grpcError(grpc.status.UNAVAILABLE, 'still unavailable'); },
+    });
+
+    failConnection();
+    await expect(fabric.ensureFabricConnected()).rejects.toThrow('still unavailable');
+
+    for (const [index, delay] of [250, 1000, 5000, 5000].entries()) {
+      failConnection();
+      const attempt = fabric.ensureFabricConnected();
+      const rejection = expect(attempt).rejects.toThrow('still unavailable');
+      await jest.advanceTimersByTimeAsync(delay - 1);
+      expect(fabricGateway.connect).toHaveBeenCalledTimes(index + 1);
+      await jest.advanceTimersByTimeAsync(1);
+      await rejection;
+      expect(fabricGateway.connect).toHaveBeenCalledTimes(index + 2);
+    }
   });
 
   test('returns disabled before reading identity files or opening a socket', async () => {
@@ -261,6 +350,7 @@ describe('immutable Fabric command execution', () => {
     } catch (_) {
       // Module cleanup is best-effort after expected connection failures.
     }
+    jest.useRealTimers();
     process.env = originalEnv;
   });
 
@@ -365,6 +455,22 @@ describe('immutable Fabric command execution', () => {
       .rejects.toMatchObject({ code: 'CHAIN_STATE_CONFLICT' });
   });
 
+  test('rejects an existing ANCHOR whose optional ledger field is missing', async () => {
+    installGateway({
+      verify: async (recordRef) => {
+        if (recordRef === '__health__') return { found: false, recordRef };
+        const current = ledgerAnchor();
+        delete current.soloParentIdType;
+        return current;
+      },
+    });
+    const { fabric, blockchain } = loadModules();
+
+    await expect(blockchain.executeChainCommand(anchorCommand()))
+      .rejects.toMatchObject({ code: 'CHAIN_STATE_CONFLICT' });
+    expect(fabric.isFabricConnected()).toBe(true);
+  });
+
   test.each([
     ['REVOKE', 'REVOKED', true],
     ['REVOKE', 'EXPIRED', false],
@@ -399,6 +505,84 @@ describe('immutable Fabric command execution', () => {
       .rejects.toThrow('ID already exists on chain');
   });
 
+  test('keeps a healthy connection after a deterministic endorsement failure', async () => {
+    installGateway({
+      submit: async () => {
+        throw grpcError(grpc.status.ABORTED, 'chaincode rejected duplicate record');
+      },
+    });
+    const { fabric, blockchain } = loadModules();
+
+    await expect(blockchain.executeChainCommand(anchorCommand()))
+      .rejects.toThrow('chaincode rejected duplicate record');
+    expect(fabric.isFabricConnected()).toBe(true);
+  });
+
+  test('keeps a healthy connection after malformed chaincode JSON', async () => {
+    const gateway = installGateway();
+    gateway.contract.evaluateTransaction.mockImplementation(async (name, recordRef) => {
+      if (name === 'verifyID' && recordRef === '__health__') {
+        return json({ found: false, recordRef });
+      }
+      if (name === 'verifyID') return Buffer.from('{malformed');
+      throw new Error(`Unexpected evaluation: ${name}`);
+    });
+    const { fabric, blockchain } = loadModules();
+
+    await expect(blockchain.executeChainCommand(anchorCommand())).rejects.toBeInstanceOf(SyntaxError);
+    expect(fabric.isFabricConnected()).toBe(true);
+  });
+
+  test('invalidates after an established transport failure and reconnects after backoff', async () => {
+    installGateway({
+      verify: async (recordRef) => {
+        if (recordRef === '__health__') return { found: false, recordRef };
+        throw grpcError(grpc.status.UNAVAILABLE, 'established peer disconnected');
+      },
+    });
+    const { fabric, blockchain } = loadModules();
+    jest.useFakeTimers();
+
+    await expect(blockchain.executeChainCommand(anchorCommand()))
+      .rejects.toThrow('established peer disconnected');
+    expect(fabric.isFabricConnected()).toBe(false);
+
+    installGateway();
+    const reconnect = fabric.ensureFabricConnected();
+    await jest.advanceTimersByTimeAsync(250);
+    await expect(reconnect).resolves.toEqual({ available: true });
+    expect(fabric.isFabricConnected()).toBe(true);
+  });
+
+  test('a delayed error from an old generation cannot close the replacement gateway', async () => {
+    const delayedFailure = deferred();
+    installGateway({
+      verify: async (recordRef) => {
+        if (recordRef === '__health__') return { found: false, recordRef };
+        if (recordRef === 'PWD-SLOW') return delayedFailure.promise;
+        throw grpcError(grpc.status.UNAVAILABLE, 'peer connection lost');
+      },
+    });
+    const { fabric, blockchain } = loadModules();
+    jest.useFakeTimers();
+    await fabric.ensureFabricConnected();
+
+    const slowCommand = blockchain.executeChainCommand(anchorCommand({ recordRef: 'PWD-SLOW' }));
+    await Promise.resolve();
+    await expect(blockchain.executeChainCommand(anchorCommand({ recordRef: 'PWD-FAIL' })))
+      .rejects.toThrow('peer connection lost');
+
+    const replacement = installGateway();
+    const reconnect = fabric.ensureFabricConnected();
+    await jest.advanceTimersByTimeAsync(250);
+    await reconnect;
+
+    delayedFailure.reject(grpcError(grpc.status.UNAVAILABLE, 'late old-generation failure'));
+    await expect(slowCommand).rejects.toThrow('late old-generation failure');
+    expect(replacement.gateway.close).not.toHaveBeenCalled();
+    expect(fabric.isFabricConnected()).toBe(true);
+  });
+
   test('keeps a satisfied command retryable when its receipt cannot be recovered', async () => {
     installGateway({
       verify: async (recordRef) => (recordRef === '__health__'
@@ -412,12 +596,80 @@ describe('immutable Fabric command execution', () => {
       .rejects.toMatchObject({ code: 'CHAIN_RECEIPT_RECOVERY_FAILED' });
   });
 
-  test('disconnects after a gateway error during receipt recovery', async () => {
+  test('recovers the earliest satisfying transaction from multi-entry history', async () => {
+    const current = ledgerAnchor({ status: 'REVOKED' });
+    const gateway = installGateway({
+      verify: async (recordRef) => (recordRef === '__health__'
+        ? { found: false, recordRef }
+        : current),
+      history: async () => [
+        { txId: 'tx-issued', record: ledgerAnchor() },
+        { txId: 'tx-revoked', record: current },
+      ],
+      txBlocks: {
+        'tx-issued': block(31),
+        'tx-revoked': block(32),
+      },
+    });
+    const { blockchain } = loadModules();
+
+    await expect(blockchain.executeChainCommand(anchorCommand())).resolves.toMatchObject({
+      txId: 'tx-issued',
+      blockNumber: 31,
+      reconciled: true,
+    });
+    expect(gateway.qscc.evaluateTransaction)
+      .toHaveBeenCalledWith('GetBlockByTxID', 'mychannel', 'tx-issued');
+  });
+
+  test('rejects a malformed QSCC transaction block without disconnecting', async () => {
+    installGateway({
+      verify: async (recordRef) => (recordRef === '__health__'
+        ? { found: false, recordRef }
+        : ledgerAnchor()),
+      history: async () => [{ txId: 'tx-issued', record: ledgerAnchor() }],
+      txBlocks: { 'tx-issued': Buffer.from([0xff]) },
+    });
+    const { fabric, blockchain } = loadModules();
+
+    await expect(blockchain.executeChainCommand(anchorCommand()))
+      .rejects.toMatchObject({ code: 'CHAIN_RECEIPT_RECOVERY_FAILED' });
+    expect(fabric.isFabricConnected()).toBe(true);
+  });
+
+  test('rejects a mismatched QSCC genesis block number without disconnecting', async () => {
+    installGateway({
+      verify: async (recordRef) => (recordRef === '__health__'
+        ? { found: false, recordRef }
+        : ledgerAnchor()),
+      history: async () => [{ txId: 'tx-issued', record: ledgerAnchor() }],
+      txBlocks: { 'tx-issued': block(31) },
+      genesis: block(9),
+    });
+    const { fabric, blockchain } = loadModules();
+
+    await expect(blockchain.executeChainCommand(anchorCommand()))
+      .rejects.toMatchObject({ code: 'CHAIN_RECEIPT_RECOVERY_FAILED' });
+    expect(fabric.isFabricConnected()).toBe(true);
+  });
+
+  test('keeps a healthy connection when submitted receipt block validation is local', async () => {
+    installGateway({ genesis: block(9) });
+    const { fabric, blockchain } = loadModules();
+
+    await expect(blockchain.executeChainCommand(anchorCommand()))
+      .rejects.toThrow('QSCC returned block 9, expected 0');
+    expect(fabric.isFabricConnected()).toBe(true);
+  });
+
+  test('disconnects after a transport error during receipt recovery', async () => {
     const gateway = installGateway({
       verify: async (recordRef) => (recordRef === '__health__'
         ? { found: false, recordRef }
         : ledgerAnchor()),
-      history: async () => { throw new Error('history gateway unavailable'); },
+      history: async () => {
+        throw grpcError(grpc.status.UNAVAILABLE, 'history gateway unavailable');
+      },
     });
     const { fabric, blockchain } = loadModules();
 

@@ -5,6 +5,7 @@ const { common } = require('@hyperledger/fabric-protos');
 const {
   ensureFabricConnected,
   getContract,
+  getFabricGeneration,
   getQsccContract,
   markFabricDisconnected,
 } = require('../fabric/connect');
@@ -88,11 +89,13 @@ async function requireFabric() {
 
 async function evaluateContract(transactionName, ...args) {
   await requireFabric();
+  const originatingGeneration = getFabricGeneration();
+  const contract = getContract();
   try {
-    const bytes = await getContract().evaluateTransaction(transactionName, ...args);
+    const bytes = await contract.evaluateTransaction(transactionName, ...args);
     return parseJson(bytes);
   } catch (error) {
-    markFabricDisconnected(error);
+    markFabricDisconnected(error, originatingGeneration);
     throw error;
   }
 }
@@ -104,7 +107,7 @@ async function verifyIDOnChain(idNumber) {
 function anchorFieldsMatch(outbox, current) {
   const payload = outbox.payload || {};
   const optionalTypeMatches = current.soloParentIdType === payload.soloParentIdType
-    || (current.soloParentIdType == null && payload.soloParentIdType === '');
+    || (current.soloParentIdType === null && payload.soloParentIdType === '');
 
   return current.recordRef === outbox.recordRef
     && current.hash === payload.canonicalHash
@@ -166,10 +169,12 @@ function decodeBlock(bytes, expectedNumber) {
 }
 
 async function evaluateQscc(transactionName, ...args) {
+  const originatingGeneration = getFabricGeneration();
+  const contract = getQsccContract();
   try {
-    return await getQsccContract().evaluateTransaction(transactionName, ...args);
+    return await contract.evaluateTransaction(transactionName, ...args);
   } catch (error) {
-    markFabricDisconnected(error);
+    markFabricDisconnected(error, originatingGeneration);
     throw error;
   }
 }
@@ -243,10 +248,12 @@ function submissionFor(outbox) {
 
 async function submitAndValidate(outbox) {
   const submission = submissionFor(outbox);
+  const originatingGeneration = getFabricGeneration();
+  const contract = getContract();
   let submitted;
 
   try {
-    submitted = await getContract().submitAsync(submission.transactionName, {
+    submitted = await contract.submitAsync(submission.transactionName, {
       arguments: submission.arguments,
     });
     const status = await submitted.getStatus();
@@ -264,7 +271,9 @@ async function submitAndValidate(outbox) {
     const ledgerEpoch = await getLedgerEpoch();
     return { txId, blockNumber, result, ledgerEpoch, reconciled: false };
   } catch (error) {
-    if (!(error instanceof ChainCommitError)) markFabricDisconnected(error);
+    if (!(error instanceof ChainCommitError)) {
+      markFabricDisconnected(error, originatingGeneration);
+    }
     throw error;
   }
 }
