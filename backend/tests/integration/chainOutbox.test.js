@@ -3,6 +3,7 @@
 const mongoose = require('mongoose');
 const db = require('../dbHelpers');
 const Applicant = require('../../src/models/Applicant');
+const BlockchainAnchor = require('../../src/models/BlockchainAnchor');
 const ChainOutbox = require('../../src/models/ChainOutbox');
 const IDRecord = require('../../src/models/IDRecord');
 const Sequence = require('../../src/models/Sequence');
@@ -12,6 +13,10 @@ const {
   enqueueChainOp,
   operationIdFor,
 } = require('../../src/services/chainOutbox');
+const {
+  processOperationById,
+  runChainOutboxOnce,
+} = require('../../src/workers/chainOutboxWorker');
 
 beforeAll(async () => {
   await db.connect();
@@ -58,6 +63,60 @@ async function createApplicantAndRecord() {
   });
 
   return { applicant, idRecord };
+}
+
+function fabricClient(overrides = {}) {
+  return {
+    ensureFabricConnected: jest.fn().mockResolvedValue({ available: true }),
+    executeChainCommand: jest.fn().mockResolvedValue({
+      txId: 'tx-worker',
+      blockNumber: 73,
+      ledgerEpoch: 'ledger-epoch-worker',
+      reconciled: false,
+      result: { status: 'ACTIVE' },
+    }),
+    ...overrides,
+  };
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+async function waitForCall(mock) {
+  while (mock.mock.calls.length === 0) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+async function queueOperation(overrides = {}) {
+  const idRecordId = overrides.idRecordId ?? new mongoose.Types.ObjectId();
+  const operationName = overrides.operation ?? 'ANCHOR';
+  const sequence = overrides.sequence ?? 1;
+  const recordRef = overrides.recordRef ?? `PWD-${idRecordId}`;
+  const payload = overrides.payload ?? (operationName === 'ANCHOR' ? {
+    canonicalHash: 'a'.repeat(64),
+    idType: 'PWD',
+    soloParentIdType: '',
+    issuingOffice: 'MSWDO-GERONA-TARLAC',
+  } : {});
+
+  return ChainOutbox.create({
+    operationId: overrides.operationId
+      ?? `${operationName.toLowerCase()}:${idRecordId}:${sequence}`,
+    operation: operationName,
+    idRecordId,
+    recordRef,
+    sequence,
+    payload,
+    ...overrides,
+  });
 }
 
 describe('ChainOutbox schema', () => {
@@ -407,5 +466,385 @@ describe('chain operation enqueue', () => {
 
     expect(await ChainOutbox.countDocuments()).toBe(0);
     expect((await IDRecord.findById(idRecord._id)).chainSequence).toBe(0);
+  });
+});
+
+describe('leased and ordered chain outbox execution', () => {
+  const now = new Date('2026-08-03T08:00:00.000Z');
+
+  test('two workers racing for one row claim and submit it once', async () => {
+    const queued = await queueOperation({ nextAttempt: now });
+    const client = fabricClient();
+
+    await Promise.all([
+      runChainOutboxOnce({ owner: 'worker-a', now, fabricClient: client }),
+      runChainOutboxOnce({ owner: 'worker-b', now, fabricClient: client }),
+    ]);
+
+    expect(client.executeChainCommand).toHaveBeenCalledTimes(1);
+    const persisted = await ChainOutbox.findById(queued._id).lean();
+    expect(persisted).toMatchObject({ state: 'SENT', attempts: 0, txId: 'tx-worker' });
+  });
+
+  test.each([
+    ['the five-minute default', undefined, 5 * 60_000],
+    ['an injected duration', 12_000, 12_000],
+  ])('holds %s lease while Fabric execution is in flight', async (_label, leaseMs, expectedMs) => {
+    const queued = await queueOperation({ nextAttempt: now });
+    const execution = deferred();
+    const client = fabricClient({ executeChainCommand: jest.fn(() => execution.promise) });
+
+    const run = runChainOutboxOnce({
+      owner: 'lease-worker',
+      now,
+      fabricClient: client,
+      ...(leaseMs === undefined ? {} : { leaseMs }),
+    });
+    await waitForCall(client.executeChainCommand);
+
+    expect(await ChainOutbox.findById(queued._id).lean()).toMatchObject({
+      state: 'PROCESSING',
+      lockOwner: 'lease-worker',
+      lockedUntil: new Date(now.getTime() + expectedMs),
+      attempts: 0,
+    });
+
+    execution.resolve({
+      txId: `tx-lease-${expectedMs}`,
+      blockNumber: 74,
+      ledgerEpoch: 'lease-epoch',
+      reconciled: false,
+    });
+    await run;
+  });
+
+  test('recovers an expired lease without consuming a business attempt when Fabric is unavailable', async () => {
+    const queued = await queueOperation({
+      state: 'PROCESSING',
+      attempts: 4,
+      lockOwner: 'dead-worker',
+      lockedUntil: new Date(now.getTime() - 1),
+      nextAttempt: now,
+    });
+    const client = fabricClient({
+      ensureFabricConnected: jest.fn().mockResolvedValue({ available: false, reason: 'DISABLED' }),
+    });
+
+    await runChainOutboxOnce({ owner: 'replacement', now, fabricClient: client });
+
+    const persisted = await ChainOutbox.findById(queued._id).lean();
+    expect(persisted).toMatchObject({ state: 'PENDING', attempts: 4 });
+    expect(persisted.lockOwner).toBeUndefined();
+    expect(persisted.lockedUntil).toBeUndefined();
+    expect(client.executeChainCommand).not.toHaveBeenCalled();
+  });
+
+  test.each(['PENDING', 'PROCESSING', 'BLOCKED', 'FAILED'])(
+    'blocks sequence 2 while a lower %s predecessor is not SENT',
+    async (predecessorState) => {
+      const idRecordId = new mongoose.Types.ObjectId();
+      const recordRef = `PWD-${predecessorState}`;
+      if (predecessorState === 'BLOCKED') {
+        await queueOperation({
+          idRecordId,
+          recordRef,
+          sequence: 0,
+          state: 'FAILED',
+          nextAttempt: new Date(now.getTime() + 60_000),
+        });
+      }
+      await queueOperation({
+        idRecordId,
+        recordRef,
+        sequence: 1,
+        operationId: `anchor:${idRecordId}:predecessor`,
+        state: predecessorState,
+        lockOwner: predecessorState === 'PROCESSING' ? 'active-worker' : undefined,
+        lockedUntil: predecessorState === 'PROCESSING'
+          ? new Date(now.getTime() + 60_000)
+          : undefined,
+        nextAttempt: new Date(now.getTime() + 60_000),
+      });
+      const dependent = await queueOperation({
+        idRecordId,
+        recordRef,
+        sequence: 2,
+        operation: 'REVOKE',
+        payload: { reason: 'Duplicate record' },
+        nextAttempt: now,
+      });
+      const client = fabricClient();
+
+      await runChainOutboxOnce({ owner: 'ordering-worker', now, fabricClient: client });
+
+      expect((await ChainOutbox.findById(dependent._id)).state).toBe('BLOCKED');
+      expect(client.executeChainCommand).not.toHaveBeenCalled();
+    }
+  );
+
+  test('unblocks and sends a dependent after its predecessor is SENT', async () => {
+    const idRecordId = new mongoose.Types.ObjectId();
+    const recordRef = 'PWD-SENT-PREDECESSOR';
+    await queueOperation({ idRecordId, recordRef, sequence: 1, state: 'SENT' });
+    const dependent = await queueOperation({
+      idRecordId,
+      recordRef,
+      sequence: 2,
+      operation: 'REVOKE',
+      payload: { reason: 'Superseded' },
+      state: 'BLOCKED',
+      nextAttempt: now,
+    });
+    const client = fabricClient();
+
+    await runChainOutboxOnce({ owner: 'unblock-worker', now, fabricClient: client });
+
+    expect((await ChainOutbox.findById(dependent._id)).state).toBe('SENT');
+    expect(client.executeChainCommand).toHaveBeenCalledTimes(1);
+  });
+
+  test('skips a blocked record and progresses an unrelated record in the same run', async () => {
+    const blockedId = new mongoose.Types.ObjectId();
+    await queueOperation({
+      idRecordId: blockedId,
+      recordRef: 'PWD-BLOCKED',
+      sequence: 1,
+      state: 'FAILED',
+      nextAttempt: new Date(now.getTime() + 60_000),
+      createdAt: new Date(now.getTime() - 3_000),
+    });
+    const dependent = await queueOperation({
+      idRecordId: blockedId,
+      recordRef: 'PWD-BLOCKED',
+      sequence: 2,
+      operation: 'REVOKE',
+      payload: { reason: 'Blocked behind failure' },
+      nextAttempt: now,
+      createdAt: new Date(now.getTime() - 2_000),
+    });
+    const unrelated = await queueOperation({
+      recordRef: 'PWD-UNRELATED',
+      nextAttempt: now,
+      createdAt: new Date(now.getTime() - 1_000),
+    });
+    const client = fabricClient();
+
+    await runChainOutboxOnce({ owner: 'independent-worker', now, fabricClient: client });
+
+    expect((await ChainOutbox.findById(dependent._id)).state).toBe('BLOCKED');
+    expect((await ChainOutbox.findById(unrelated._id)).state).toBe('SENT');
+    expect(client.executeChainCommand).toHaveBeenCalledWith(expect.objectContaining({
+      recordRef: 'PWD-UNRELATED',
+    }));
+  });
+
+  test.each([
+    ['disabled', jest.fn().mockResolvedValue({ available: false, reason: 'DISABLED' })],
+    ['disconnected', jest.fn().mockRejectedValue(new Error('gateway unavailable'))],
+  ])('leaves attempts and leases unchanged when Fabric is %s', async (_label, ensure) => {
+    const queued = await queueOperation({ attempts: 7, nextAttempt: now });
+    const client = fabricClient({ ensureFabricConnected: ensure });
+
+    await runChainOutboxOnce({ owner: 'availability-worker', now, fabricClient: client });
+
+    const persisted = await ChainOutbox.findById(queued._id).lean();
+    expect(persisted).toMatchObject({ state: 'PENDING', attempts: 7 });
+    expect(persisted.lockOwner).toBeUndefined();
+    expect(client.executeChainCommand).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    [0, 30_000],
+    [1, 60_000],
+    [2, 5 * 60_000],
+    [3, 15 * 60_000],
+    [4, 60 * 60_000],
+    [8, 60 * 60_000],
+  ])('schedules failure from attempt %i with the exact capped backoff', async (
+    attempts,
+    delayMs
+  ) => {
+    const queued = await queueOperation({ attempts, nextAttempt: now });
+    const conflict = Object.assign(new Error('deterministic conflict'), {
+      code: 'CHAIN_STATE_CONFLICT',
+    });
+    const client = fabricClient({
+      executeChainCommand: jest.fn().mockRejectedValue(conflict),
+    });
+
+    await runChainOutboxOnce({ owner: 'retry-worker', now, fabricClient: client });
+
+    const persisted = await ChainOutbox.findById(queued._id).lean();
+    expect(persisted).toMatchObject({ state: 'PENDING', attempts: attempts + 1 });
+    expect(persisted.nextAttempt).toEqual(new Date(now.getTime() + delayMs));
+    expect(persisted.lastError).toBe('deterministic conflict');
+    expect(persisted.lockOwner).toBeUndefined();
+  });
+
+  test.each(['ANCHOR', 'EXPIRE'])(
+    'moves %s to FAILED on the twentieth failed attempt',
+    async (operationName) => {
+      const queued = await queueOperation({
+        operation: operationName,
+        ...(operationName === 'EXPIRE' ? { payload: {} } : {}),
+        attempts: 19,
+        nextAttempt: now,
+      });
+      const client = fabricClient({
+        executeChainCommand: jest.fn().mockRejectedValue(new Error('command rejected')),
+      });
+
+      await runChainOutboxOnce({ owner: 'terminal-worker', now, fabricClient: client });
+
+      expect(await ChainOutbox.findById(queued._id).lean()).toMatchObject({
+        state: 'FAILED',
+        attempts: 20,
+        lastError: 'command rejected',
+      });
+    }
+  );
+
+  test('keeps REVOKE pending forever and sets alertedAt only on attempt 20', async () => {
+    const queued = await queueOperation({
+      operation: 'REVOKE',
+      payload: { reason: 'Confirmed duplicate' },
+      attempts: 19,
+      nextAttempt: now,
+    });
+    const client = fabricClient({
+      executeChainCommand: jest.fn().mockRejectedValue(new Error('endorsement rejected')),
+    });
+
+    await runChainOutboxOnce({ owner: 'revoke-worker', now, fabricClient: client });
+    const afterTwenty = await ChainOutbox.findById(queued._id).lean();
+    expect(afterTwenty).toMatchObject({ state: 'PENDING', attempts: 20 });
+    expect(afterTwenty.alertedAt).toEqual(now);
+    expect(afterTwenty.nextAttempt).toEqual(new Date(now.getTime() + 60 * 60_000));
+
+    const nextRun = new Date(now.getTime() + 60 * 60_000);
+    await runChainOutboxOnce({ owner: 'revoke-worker', now: nextRun, fabricClient: client });
+    const afterTwentyOne = await ChainOutbox.findById(queued._id).lean();
+    expect(afterTwentyOne).toMatchObject({ state: 'PENDING', attempts: 21 });
+    expect(afterTwentyOne.alertedAt).toEqual(now);
+    expect(afterTwentyOne.nextAttempt).toEqual(new Date(nextRun.getTime() + 60 * 60_000));
+  });
+
+  test.each([false, true])(
+    'commits ANCHOR receipt and SENT together (reconciled: %s)',
+    async (reconciled) => {
+      const idRecordId = new mongoose.Types.ObjectId();
+      const queued = await queueOperation({
+        idRecordId,
+        recordRef: `PWD-ANCHOR-${reconciled}`,
+        nextAttempt: now,
+      });
+      const client = fabricClient({
+        executeChainCommand: jest.fn().mockResolvedValue({
+          txId: `tx-anchor-${reconciled}`,
+          blockNumber: 91,
+          ledgerEpoch: 'ledger-epoch-anchor',
+          reconciled,
+          result: { status: 'ACTIVE' },
+        }),
+      });
+
+      await runChainOutboxOnce({ owner: 'anchor-worker', now, fabricClient: client });
+
+      const [outbox, anchor] = await Promise.all([
+        ChainOutbox.findById(queued._id).lean(),
+        BlockchainAnchor.findOne({ idRecordId }).lean(),
+      ]);
+      expect(outbox).toMatchObject({
+        state: 'SENT',
+        txId: `tx-anchor-${reconciled}`,
+        blockNumber: 91,
+        ledgerEpoch: 'ledger-epoch-anchor',
+        reconciled,
+        completedAt: now,
+      });
+      expect(outbox.lockOwner).toBeUndefined();
+      expect(outbox.lastError).toBeUndefined();
+      expect(anchor).toMatchObject({
+        idRecordId,
+        recordRef: `PWD-ANCHOR-${reconciled}`,
+        canonicalHash: 'a'.repeat(64),
+        txId: `tx-anchor-${reconciled}`,
+        blockNumber: 91,
+        ledgerEpoch: 'ledger-epoch-anchor',
+        receiptState: 'CURRENT',
+      });
+      if (reconciled) expect(anchor.reconciledAt).toEqual(now);
+      else expect(anchor.reconciledAt).toBeUndefined();
+    }
+  );
+
+  test('rolls back the ANCHOR update when the guarded SENT transition cannot commit', async () => {
+    const idRecordId = new mongoose.Types.ObjectId();
+    const queued = await queueOperation({ idRecordId, recordRef: 'PWD-OWNER-LOSS', nextAttempt: now });
+    const execution = deferred();
+    const client = fabricClient({ executeChainCommand: jest.fn(() => execution.promise) });
+
+    const run = runChainOutboxOnce({ owner: 'original-owner', now, fabricClient: client });
+    await waitForCall(client.executeChainCommand);
+    await ChainOutbox.updateOne(
+      { _id: queued._id, state: 'PROCESSING' },
+      { $set: { lockOwner: 'replacement-owner' } }
+    );
+    execution.resolve({
+      txId: 'tx-owner-loss',
+      blockNumber: 99,
+      ledgerEpoch: 'owner-loss-epoch',
+      reconciled: false,
+    });
+    await run;
+
+    expect(await BlockchainAnchor.countDocuments({ idRecordId })).toBe(0);
+    expect(await ChainOutbox.findById(queued._id).lean()).toMatchObject({
+      state: 'PROCESSING',
+      lockOwner: 'replacement-owner',
+    });
+  });
+
+  test('guards a failure transition when lease ownership changes during execution', async () => {
+    const queued = await queueOperation({ nextAttempt: now });
+    const execution = deferred();
+    const client = fabricClient({ executeChainCommand: jest.fn(() => execution.promise) });
+
+    const run = runChainOutboxOnce({ owner: 'failure-owner', now, fabricClient: client });
+    await waitForCall(client.executeChainCommand);
+    await ChainOutbox.updateOne(
+      { _id: queued._id, state: 'PROCESSING' },
+      { $set: { lockOwner: 'replacement-owner' } }
+    );
+    execution.reject(new Error('late failure'));
+    await run;
+
+    expect(await ChainOutbox.findById(queued._id).lean()).toMatchObject({
+      state: 'PROCESSING',
+      lockOwner: 'replacement-owner',
+      attempts: 0,
+    });
+  });
+
+  test('processOperationById and the background scan share one atomic claim path', async () => {
+    const queued = await queueOperation({ nextAttempt: now });
+    const client = fabricClient();
+
+    await Promise.all([
+      processOperationById(queued.operationId, {
+        owner: 'manual-owner', now, fabricClient: client, leaseMs: 12_000,
+      }),
+      runChainOutboxOnce({
+        owner: 'background-owner', now, fabricClient: client, leaseMs: 12_000,
+      }),
+    ]);
+
+    expect(client.executeChainCommand).toHaveBeenCalledTimes(1);
+    expect((await ChainOutbox.findById(queued._id)).state).toBe('SENT');
+  });
+
+  test.each(['', '   ', null])('requires a non-empty lease owner: %p', async (owner) => {
+    await expect(runChainOutboxOnce({ owner, now, fabricClient: fabricClient() }))
+      .rejects.toThrow('owner');
   });
 });

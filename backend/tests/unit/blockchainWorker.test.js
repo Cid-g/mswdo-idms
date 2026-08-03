@@ -679,3 +679,94 @@ describe('immutable Fabric command execution', () => {
     expect(gateway.gateway.close).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('chain outbox worker timer lifecycle', () => {
+  function loadWorker({ executeChainCommand = jest.fn().mockResolvedValue({}) } = {}) {
+    const claimed = {
+      _id: 'outbox-id',
+      operationId: 'anchor:outbox-id',
+      operation: 'ANCHOR',
+      recordRef: 'PWD-TIMER',
+      payload: { canonicalHash: 'a'.repeat(64) },
+    };
+    const chainOutbox = {
+      recoverExpiredLeases: jest.fn().mockResolvedValue(),
+      reevaluateBlockedOperations: jest.fn().mockResolvedValue(),
+      claimNextOperation: jest.fn()
+        .mockResolvedValueOnce(claimed)
+        .mockResolvedValue(null),
+      completeOperation: jest.fn().mockResolvedValue(true),
+      failOperation: jest.fn().mockResolvedValue(true),
+    };
+    const fabricClient = {
+      ensureFabricConnected: jest.fn().mockResolvedValue({ available: true }),
+      executeChainCommand,
+    };
+
+    jest.doMock('../../src/services/chainOutbox', () => chainOutbox);
+    jest.doMock('../../src/fabric/connect', () => ({
+      ensureFabricConnected: fabricClient.ensureFabricConnected,
+    }));
+    jest.doMock('../../src/services/blockchain', () => ({
+      executeChainCommand: fabricClient.executeChainCommand,
+    }));
+
+    return {
+      worker: require('../../src/workers/chainOutboxWorker'),
+      chainOutbox,
+      fabricClient,
+    };
+  }
+
+  beforeEach(() => {
+    jest.resetModules();
+    jest.useFakeTimers();
+  });
+
+  afterEach(async () => {
+    jest.useRealTimers();
+    jest.dontMock('../../src/services/chainOutbox');
+    jest.dontMock('../../src/fabric/connect');
+    jest.dontMock('../../src/services/blockchain');
+  });
+
+  test('does not start a timer or process work on import', async () => {
+    const { worker, fabricClient } = loadWorker();
+
+    await jest.advanceTimersByTimeAsync(60_000);
+
+    expect(fabricClient.ensureFabricConnected).not.toHaveBeenCalled();
+    await worker.stopChainOutboxWorker();
+  });
+
+  test('prevents duplicate timers and overlapping ticks, then awaits the in-flight tick on stop', async () => {
+    const execution = deferred();
+    const executeChainCommand = jest.fn(() => execution.promise);
+    const { worker, fabricClient } = loadWorker({ executeChainCommand });
+
+    worker.startChainOutboxWorker({ intervalMs: 100 });
+    worker.startChainOutboxWorker({ intervalMs: 100 });
+    await jest.advanceTimersByTimeAsync(100);
+    expect(executeChainCommand).toHaveBeenCalledTimes(1);
+
+    await jest.advanceTimersByTimeAsync(500);
+    expect(fabricClient.ensureFabricConnected).toHaveBeenCalledTimes(1);
+    expect(executeChainCommand).toHaveBeenCalledTimes(1);
+
+    let stopped = false;
+    const stopping = worker.stopChainOutboxWorker().then(() => { stopped = true; });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+    execution.resolve({
+      txId: 'tx-timer',
+      blockNumber: 1,
+      ledgerEpoch: 'timer-epoch',
+      reconciled: false,
+    });
+    await stopping;
+    expect(stopped).toBe(true);
+
+    await jest.advanceTimersByTimeAsync(500);
+    expect(fabricClient.ensureFabricConnected).toHaveBeenCalledTimes(1);
+  });
+});
