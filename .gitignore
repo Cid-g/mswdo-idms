@@ -9,8 +9,12 @@
 AGENTS.md
 CLAUDE.md
 
-# Internal documentation excluded from the final submission
-docs/
+# Internal documentation excluded from the final submission.
+# Tracked in git anyway so the specs and plans are backed up — "not part of the
+# submission bundle" is a packaging concern, not a reason to have no backup.
+# Only bulky binary sources stay out.
+docs/thesis files/
+docs/*.docx
 
 # Root-level screenshots, source templates, and reference images
 /*.png
