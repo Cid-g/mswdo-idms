@@ -4,6 +4,7 @@
 .codex/
 .superpowers/
 .playwright-mcp/
+.worktrees/
 
 # Agent instruction files used only during development
 AGENTS.md
