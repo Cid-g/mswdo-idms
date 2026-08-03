@@ -2,10 +2,16 @@
 
 const mongoose = require('mongoose');
 const db = require('../dbHelpers');
+const Applicant = require('../../src/models/Applicant');
 const ChainOutbox = require('../../src/models/ChainOutbox');
 const IDRecord = require('../../src/models/IDRecord');
 const Sequence = require('../../src/models/Sequence');
 const { withMongoTransaction } = require('../../src/lib/transactions');
+const {
+  buildAnchorPayload,
+  enqueueChainOp,
+  operationIdFor,
+} = require('../../src/services/chainOutbox');
 
 beforeAll(async () => {
   await db.connect();
@@ -29,6 +35,29 @@ function operation(overrides = {}) {
     },
     ...overrides,
   };
+}
+
+async function createApplicantAndRecord() {
+  const applicant = await Applicant.create({
+    department: 'PWD',
+    encodedById: new mongoose.Types.ObjectId(),
+    lastName: 'Santos',
+    firstName: 'Maria',
+    middleName: 'Reyes',
+    birthdate: new Date('1980-01-02T00:00:00.000Z'),
+    sex: 'Female',
+    status: 'COMPLETE',
+  });
+  const idRecord = await IDRecord.create({
+    applicantId: applicant._id,
+    department: 'PWD',
+    idNumber: 'PWD-2026-0000100',
+    qrToken: 'task-2-3-enqueue',
+    issuedDate: new Date('2026-08-03T00:00:00.000Z'),
+    expiryDate: new Date('2031-08-03T00:00:00.000Z'),
+  });
+
+  return { applicant, idRecord };
 }
 
 describe('ChainOutbox schema', () => {
@@ -167,5 +196,216 @@ describe('withMongoTransaction', () => {
 
     expect(await Sequence.countDocuments({ name: 'tx-helper-rollback' })).toBe(0);
     expect(usedSession.hasEnded).toBe(true);
+  });
+});
+
+describe('chain operation enqueue', () => {
+  test('builds the immutable ANCHOR command from the event snapshot', async () => {
+    const { applicant, idRecord } = await createApplicantAndRecord();
+
+    const payload = buildAnchorPayload(applicant, idRecord);
+
+    expect(payload).toEqual({
+      canonicalHash: '4db9eb350e440fd818e1532ae1843e6b91680f03c7da1ae7503a6dc3ce0eb025',
+      idType: 'PWD',
+      soloParentIdType: '',
+      issuingOffice: 'MSWDO-GERONA-TARLAC',
+    });
+    expect(Object.isFrozen(payload)).toBe(true);
+    expect(operationIdFor('ANCHOR', idRecord._id)).toBe(`anchor:${idRecord._id}`);
+  });
+
+  test('keeps the queued ANCHOR payload unchanged after applicant edits', async () => {
+    const { applicant, idRecord } = await createApplicantAndRecord();
+    const payload = buildAnchorPayload(applicant, idRecord);
+
+    await withMongoTransaction((session) => enqueueChainOp({
+      session,
+      operationId: operationIdFor('ANCHOR', idRecord._id),
+      operation: 'ANCHOR',
+      idRecordId: idRecord._id,
+      payload,
+    }));
+
+    applicant.firstName = 'Marissa';
+    await applicant.save();
+
+    const queued = await ChainOutbox.findOne({ idRecordId: idRecord._id }).lean();
+    expect(queued.payload).toEqual({
+      canonicalHash: '4db9eb350e440fd818e1532ae1843e6b91680f03c7da1ae7503a6dc3ce0eb025',
+      idType: 'PWD',
+      soloParentIdType: '',
+      issuingOffice: 'MSWDO-GERONA-TARLAC',
+    });
+    expect(buildAnchorPayload(applicant, idRecord).canonicalHash)
+      .not.toBe(queued.payload.canonicalHash);
+  });
+
+  test('returns one command and consumes one sequence for a duplicate operation ID', async () => {
+    const { applicant, idRecord } = await createApplicantAndRecord();
+    const command = {
+      operationId: operationIdFor('ANCHOR', idRecord._id),
+      operation: 'ANCHOR',
+      idRecordId: idRecord._id,
+      payload: buildAnchorPayload(applicant, idRecord),
+    };
+    let first;
+    let duplicate;
+
+    await withMongoTransaction(async (session) => {
+      first = await enqueueChainOp({ session, ...command });
+      duplicate = await enqueueChainOp({ session, ...command });
+    });
+
+    expect(duplicate._id.toString()).toBe(first._id.toString());
+    expect(await ChainOutbox.countDocuments()).toBe(1);
+    expect((await IDRecord.findById(idRecord._id)).chainSequence).toBe(1);
+  });
+
+  test('converges concurrent identical commands from independent transactions', async () => {
+    const { applicant, idRecord } = await createApplicantAndRecord();
+    const command = {
+      operationId: operationIdFor('ANCHOR', idRecord._id),
+      operation: 'ANCHOR',
+      idRecordId: idRecord._id,
+      payload: buildAnchorPayload(applicant, idRecord),
+    };
+
+    const [first, duplicate] = await Promise.all([
+      withMongoTransaction((session) => enqueueChainOp({ session, ...command })),
+      withMongoTransaction((session) => enqueueChainOp({ session, ...command })),
+    ]);
+
+    expect(duplicate._id.toString()).toBe(first._id.toString());
+    expect(await ChainOutbox.countDocuments()).toBe(1);
+    expect((await IDRecord.findById(idRecord._id)).chainSequence).toBe(1);
+  });
+
+  test('rejects a concurrent operation ID collision from independent transactions', async () => {
+    const { applicant, idRecord } = await createApplicantAndRecord();
+    const operationId = operationIdFor('ANCHOR', idRecord._id);
+    const baseCommand = {
+      operationId,
+      operation: 'ANCHOR',
+      idRecordId: idRecord._id,
+      payload: buildAnchorPayload(applicant, idRecord),
+    };
+    const conflictingCommand = {
+      ...baseCommand,
+      payload: { ...baseCommand.payload, canonicalHash: 'b'.repeat(64) },
+    };
+
+    const results = await Promise.allSettled([
+      withMongoTransaction((session) => enqueueChainOp({ session, ...baseCommand })),
+      withMongoTransaction((session) => enqueueChainOp({ session, ...conflictingCommand })),
+    ]);
+    const fulfilled = results.filter((result) => result.status === 'fulfilled');
+    const rejected = results.filter((result) => result.status === 'rejected');
+
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0].reason).toMatchObject({ code: 'CHAIN_OPERATION_ID_COLLISION' });
+    expect(await ChainOutbox.countDocuments()).toBe(1);
+    expect((await IDRecord.findById(idRecord._id)).chainSequence).toBe(1);
+  });
+
+  test('rejects an operation ID collision without consuming another sequence', async () => {
+    const { applicant, idRecord } = await createApplicantAndRecord();
+    const operationId = operationIdFor('ANCHOR', idRecord._id);
+
+    await withMongoTransaction((session) => enqueueChainOp({
+      session,
+      operationId,
+      operation: 'ANCHOR',
+      idRecordId: idRecord._id,
+      payload: buildAnchorPayload(applicant, idRecord),
+    }));
+
+    await expect(withMongoTransaction((session) => enqueueChainOp({
+      session,
+      operationId,
+      operation: 'ANCHOR',
+      idRecordId: idRecord._id,
+      payload: {
+        canonicalHash: 'b'.repeat(64),
+        idType: 'PWD',
+        soloParentIdType: '',
+        issuingOffice: 'MSWDO-GERONA-TARLAC',
+      },
+    }))).rejects.toMatchObject({ code: 'CHAIN_OPERATION_ID_COLLISION' });
+
+    expect(await ChainOutbox.countDocuments()).toBe(1);
+    expect((await IDRecord.findById(idRecord._id)).chainSequence).toBe(1);
+  });
+
+  test('rolls back business state and sequence when outbox validation fails', async () => {
+    const { idRecord } = await createApplicantAndRecord();
+
+    await expect(withMongoTransaction(async (session) => {
+      await IDRecord.updateOne(
+        { _id: idRecord._id },
+        { $set: { status: 'REVOKED' } },
+        { session }
+      );
+      await enqueueChainOp({
+        session,
+        operationId: operationIdFor('REVOKE', idRecord._id),
+        operation: 'INVALID',
+        idRecordId: idRecord._id,
+        payload: { reason: 'test' },
+      });
+    })).rejects.toThrow();
+
+    const persisted = await IDRecord.findById(idRecord._id).lean();
+    expect(persisted.status).toBe('ACTIVE');
+    expect(persisted.chainSequence).toBe(0);
+    expect(await ChainOutbox.countDocuments()).toBe(0);
+  });
+
+  test('allocates strictly increasing sequences for different operations', async () => {
+    const { applicant, idRecord } = await createApplicantAndRecord();
+    let anchor;
+    let revoke;
+
+    await withMongoTransaction(async (session) => {
+      anchor = await enqueueChainOp({
+        session,
+        operationId: operationIdFor('ANCHOR', idRecord._id),
+        operation: 'ANCHOR',
+        idRecordId: idRecord._id,
+        payload: buildAnchorPayload(applicant, idRecord),
+      });
+      revoke = await enqueueChainOp({
+        session,
+        operationId: operationIdFor('REVOKE', idRecord._id),
+        operation: 'REVOKE',
+        idRecordId: idRecord._id,
+        payload: { reason: 'Duplicate record' },
+      });
+    });
+
+    expect(anchor.sequence).toBe(1);
+    expect(revoke.sequence).toBe(2);
+    expect((await IDRecord.findById(idRecord._id)).chainSequence).toBe(2);
+  });
+
+  test('rejects enqueue outside an active MongoDB transaction', async () => {
+    const { applicant, idRecord } = await createApplicantAndRecord();
+    const session = await mongoose.startSession();
+
+    try {
+      await expect(enqueueChainOp({
+        session,
+        operationId: operationIdFor('ANCHOR', idRecord._id),
+        operation: 'ANCHOR',
+        idRecordId: idRecord._id,
+        payload: buildAnchorPayload(applicant, idRecord),
+      })).rejects.toThrow('active MongoDB transaction');
+    } finally {
+      await session.endSession();
+    }
+
+    expect(await ChainOutbox.countDocuments()).toBe(0);
+    expect((await IDRecord.findById(idRecord._id)).chainSequence).toBe(0);
   });
 });
