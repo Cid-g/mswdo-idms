@@ -4,10 +4,17 @@ const { randomUUID } = require('node:crypto');
 const os = require('node:os');
 
 const chainOutbox = require('../services/chainOutbox');
-const { ensureFabricConnected } = require('../fabric/connect');
+const fabricConnection = require('../fabric/connect');
 const { executeChainCommand } = require('../services/blockchain');
+const { assertLedgerEpochActive, getLedgerEpoch } = require('../services/ledgerReconciliation');
 
-const defaultFabricClient = { ensureFabricConnected, executeChainCommand };
+const defaultFabricClient = {
+  ensureFabricConnected: fabricConnection.ensureFabricConnected,
+  executeChainCommand,
+};
+if (typeof fabricConnection.getQsccContract === 'function') {
+  defaultFabricClient.getLedgerEpoch = getLedgerEpoch;
+}
 const schedulerOwner = `${os.hostname()}:${process.pid}:${randomUUID()}`;
 
 let timer = null;
@@ -27,12 +34,28 @@ async function prepareForClaim({ now, fabricClient }) {
   await chainOutbox.recoverExpiredLeases(now);
   await chainOutbox.reevaluateBlockedOperations(now);
 
+  let availability;
   try {
-    const availability = await fabricClient.ensureFabricConnected();
-    return availability?.available === true;
+    availability = await fabricClient.ensureFabricConnected();
   } catch (_) {
-    return false;
+    return { available: false, state: 'FABRIC_UNAVAILABLE' };
   }
+  if (availability?.available !== true) {
+    return { available: false, state: 'FABRIC_UNAVAILABLE' };
+  }
+
+  if (typeof fabricClient.getLedgerEpoch === 'function') {
+    try {
+      await assertLedgerEpochActive({ fabricClient, now });
+    } catch (error) {
+      if (error?.code === 'FABRIC_LEDGER_EPOCH_MISMATCH') {
+        return { available: false, state: 'LEDGER_EPOCH_MISMATCH' };
+      }
+      throw error;
+    }
+  }
+
+  return { available: true };
 }
 
 function isInfrastructureError(error) {
@@ -110,8 +133,8 @@ async function processOnce({
     ? timeFrom(clock)
     : (now instanceof Date ? now : new Date(now));
 
-  const available = await prepareForClaim({ now: claimTime, fabricClient });
-  if (!available) return { processed: false, state: 'FABRIC_UNAVAILABLE' };
+  const readiness = await prepareForClaim({ now: claimTime, fabricClient });
+  if (!readiness.available) return { processed: false, state: readiness.state };
 
   const claimed = await chainOutbox.claimNextOperation({
     owner,
