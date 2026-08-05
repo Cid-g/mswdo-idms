@@ -31,6 +31,15 @@ const IDRecordSchema = new Schema(
     releasedById:       { type: Schema.Types.ObjectId, ref: 'User' },
     blockchainAnchorId: { type: Schema.Types.ObjectId, ref: 'BlockchainAnchor' },
     chainSequence:      { type: Number, default: 0 },
+    verifyRevision:     {
+      type: Number,
+      default: 0,
+      min: 0,
+      validate: {
+        validator: Number.isSafeInteger,
+        message: 'verifyRevision must be a non-negative safe integer',
+      },
+    },
   },
   { timestamps: true }
 );
