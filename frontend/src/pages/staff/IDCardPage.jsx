@@ -62,6 +62,7 @@ export default function IDCardPage() {
   const [blockchainStatus, setBlockchainStatus] = useState(null);
   const [verifying,        setVerifying]        = useState(false);
   const [anchoring,        setAnchoring]        = useState(false);
+  const [revocationNotice, setRevocationNotice] = useState('');
 
   const imageUrlRef     = useRef(null);
   const backImageUrlRef = useRef(null);
@@ -90,6 +91,7 @@ export default function IDCardPage() {
     setError('');
     setActiveTab('front');
     setBlockchainStatus(null);
+    setRevocationNotice('');
     try {
       const { data: a } = await api.get(`/applicants/${applicantId}`);
       setApplicant(a);
@@ -150,6 +152,11 @@ export default function IDCardPage() {
         setBackImageUrl(null);
       }
 
+      try {
+        const bc = await getBlockchainStatus(record._id);
+        setBlockchainStatus(bc);
+      } catch { /* durable queue state remains available on the next refresh */ }
+
       showToast('success', 'ID card generated successfully!');
     } catch (e) {
       setError(e.response?.data?.error?.message || 'ID generation failed.');
@@ -180,7 +187,21 @@ export default function IDCardPage() {
       setIDRecord(updated);
       setRevokeModal(false);
       setRevokeReason('');
-      showToast('success', 'ID card has been revoked.');
+
+      const syncState = updated.chainSync;
+      if (syncState?.state === 'PENDING' && syncState.operation === 'REVOKE') {
+        const message = 'ID revoked locally. Blockchain sync pending.';
+        setRevocationNotice(message);
+        showToast('success', message);
+      } else if (syncState?.state === 'NOT_APPLICABLE' && syncState.reason === 'NEVER_ANCHORED') {
+        const message = 'ID revoked. This card was never recorded on the blockchain.';
+        setRevocationNotice(message);
+        showToast('success', message);
+      } else {
+        const message = 'ID card has been revoked.';
+        setRevocationNotice(message);
+        showToast('success', message);
+      }
     } catch (e) {
       showToast('error', e.response?.data?.error?.message || 'Revocation failed.');
     } finally {
@@ -216,14 +237,27 @@ export default function IDCardPage() {
     setAnchoring(true);
     try {
       const result = await anchorRecord(idRecord._id);
-      setBlockchainStatus({
-        anchored:        true,
-        canonicalHash:   result.hash,
-        anchoredAt:      result.anchor.anchoredAt,
-        lastCheckedAt:   null,
-        lastCheckPassed: null,
-      });
-      showToast('success', 'ID record anchored to blockchain.');
+      if (result.receiptVerified && result.anchor) {
+        setBlockchainStatus({
+          anchored: true,
+          canonicalHash: result.anchor.canonicalHash ?? result.hash,
+          txId: result.anchor.txId,
+          blockNumber: result.anchor.blockNumber,
+          ledgerEpoch: result.anchor.ledgerEpoch,
+          receiptState: result.anchor.receiptState,
+          anchoredAt: result.anchor.anchoredAt,
+          lastCheckedAt: null,
+          lastCheckPassed: null,
+          chainSync: result,
+        });
+        showToast('success', 'ID record anchored to blockchain.');
+      } else {
+        setBlockchainStatus({
+          anchored: false,
+          chainSync: result,
+        });
+        showToast('success', `Blockchain sync queued (${result.state ?? 'PENDING'}).`);
+      }
     } catch (e) {
       showToast('error', e.response?.data?.error?.message || 'Anchoring failed.');
     } finally {
@@ -278,6 +312,8 @@ export default function IDCardPage() {
         {/* Toast */}
         {toast && (
           <div
+            role="status"
+            aria-live="polite"
             className="fixed top-4 right-4 z-50 flex items-center gap-2 px-4 py-3 rounded-xl text-sm font-medium no-print"
             style={
               toast.type === 'success'
@@ -343,6 +379,9 @@ export default function IDCardPage() {
               )}
               {idRecord.revokedAt && (
                 <p className="mt-0.5 text-xs" style={{ color: '#7F1D1D' }}>Revoked on {fmtDate(idRecord.revokedAt)}</p>
+              )}
+              {revocationNotice && (
+                <p className="mt-2 text-xs font-semibold" style={{ color: '#7F1D1D' }}>{revocationNotice}</p>
               )}
             </div>
           </div>
@@ -498,7 +537,7 @@ export default function IDCardPage() {
                   onAnchor={handleAnchorNow}
                   verifying={verifying}
                   anchoring={anchoring}
-                  canAnchor={user?.role === 'SUPERADMIN' || user?.role === 'ADMIN'}
+                  canAnchor={user?.role === 'SUPERADMIN'}
                 />
               </div>
             </div>
@@ -698,22 +737,60 @@ function BlockchainStatusPanel({ status, onVerify, onAnchor, verifying, anchorin
   }
 
   if (!status.anchored) {
+    const sync = status.chainSync;
+    const syncState = sync?.state;
+    const copy = {
+      PENDING: {
+        title: 'Blockchain Sync Queued',
+        body: 'The anchor intent is durable and waiting for the background worker.',
+        background: 'var(--color-warning-bg)',
+        color: '#92400E',
+      },
+      PROCESSING: {
+        title: 'Blockchain Sync in Progress',
+        body: 'A worker is currently submitting or reconciling this anchor.',
+        background: 'var(--color-info-bg)',
+        color: 'var(--color-info)',
+      },
+      BLOCKED: {
+        title: 'Blockchain Sync Blocked',
+        body: 'This anchor is waiting for an earlier blockchain operation to finish.',
+        background: 'var(--color-warning-bg)',
+        color: '#92400E',
+      },
+      FAILED: {
+        title: 'Blockchain Sync Needs Attention',
+        body: sync?.lastError || 'A SuperAdmin must retry or reconcile this operation.',
+        background: 'var(--color-danger-bg)',
+        color: 'var(--color-danger)',
+      },
+    }[syncState] ?? {
+      title: 'Not Recorded on the Blockchain',
+      body: 'No verified anchor receipt exists for this ID.',
+      background: 'var(--color-warning-bg)',
+      color: '#92400E',
+    };
+
     return (
       <div className="flex flex-col gap-2">
-        <div className="flex items-start gap-3 p-3 rounded-lg" style={{ background: 'var(--color-warning-bg)' }}>
-          <Clock className="w-4 h-4 flex-shrink-0 mt-0.5" style={{ color: 'var(--color-warning)' }} />
-          <div>
-            <p className="text-xs font-semibold" style={{ color: '#92400E' }}>Pending Anchor</p>
-            <p className="text-xs mt-0.5" style={{ color: '#92400E' }}>
-              Not yet recorded on the blockchain.
-            </p>
+        <div className="flex items-start gap-3 p-3 rounded-lg" style={{ background: copy.background }}>
+          <Clock className="w-4 h-4 flex-shrink-0 mt-0.5" style={{ color: copy.color }} />
+          <div className="min-w-0">
+            <p className="text-xs font-semibold" style={{ color: copy.color }}>{copy.title}</p>
+            <p className="text-xs mt-0.5 break-words" style={{ color: copy.color }}>{copy.body}</p>
+            {sync?.operationId && (
+              <p className="text-[11px] mt-1 font-mono break-all" style={{ color: 'var(--color-muted)' }}>
+                {sync.operationId} · {sync.state}
+              </p>
+            )}
           </div>
         </div>
-        {canAnchor && (
+        {canAnchor && !['PENDING', 'PROCESSING'].includes(syncState) && (
           <button
+            type="button"
             onClick={onAnchor}
             disabled={anchoring}
-            className="flex items-center justify-center gap-2 w-full h-9 px-4 rounded-xl text-xs font-semibold border transition-all"
+            className="flex items-center justify-center gap-2 w-full h-9 px-4 rounded-xl text-xs font-semibold border transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2"
             style={{
               borderColor: 'var(--color-border)',
               color: anchoring ? 'var(--color-muted)' : 'var(--color-text-1)',
@@ -725,35 +802,38 @@ function BlockchainStatusPanel({ status, onVerify, onAnchor, verifying, anchorin
             onMouseLeave={(e) => { e.currentTarget.style.filter = 'brightness(1)'; }}
           >
             {anchoring
-              ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Anchoring...</>
-              : <><ShieldCheck className="w-3.5 h-3.5" /> Anchor Now</>}
+              ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Queueing...</>
+              : <><ShieldCheck className="w-3.5 h-3.5" /> Queue Anchor</>}
           </button>
         )}
       </div>
     );
   }
 
-  const hashPreview  = status.canonicalHash ? `${status.canonicalHash.slice(0, 10)}…` : '—';
-  const txPreview    = status.txId ? `${status.txId.slice(0, 10)}…` : null;
-  const everChecked  = status.lastCheckedAt != null;
-  const checkPassed  = status.lastCheckPassed;
+  const hashPreview = status.canonicalHash ? `${status.canonicalHash.slice(0, 10)}…` : '—';
+  const txPreview = status.txId ? `${status.txId.slice(0, 10)}…` : null;
+  const everChecked = status.lastCheckedAt != null;
+  const checkPassed = status.lastCheckPassed;
+  const staleReceipt = status.receiptState === 'STALE';
+  const failedIntegrity = everChecked && !checkPassed;
+  const panelBackground = staleReceipt || failedIntegrity
+    ? 'var(--color-danger-bg)'
+    : 'var(--color-success-bg)';
+  const panelColor = staleReceipt || failedIntegrity
+    ? 'var(--color-danger)'
+    : 'var(--color-success)';
 
   return (
     <div className="flex flex-col gap-2">
-      <div
-        className="flex items-start gap-3 p-3 rounded-lg"
-        style={{ background: everChecked && !checkPassed ? 'var(--color-danger-bg)' : 'var(--color-success-bg)' }}
-      >
-        <ShieldCheck
-          className="w-4 h-4 flex-shrink-0 mt-0.5"
-          style={{ color: everChecked && !checkPassed ? 'var(--color-danger)' : 'var(--color-success)' }}
-        />
+      <div className="flex items-start gap-3 p-3 rounded-lg" style={{ background: panelBackground }}>
+        <ShieldCheck className="w-4 h-4 flex-shrink-0 mt-0.5" style={{ color: panelColor }} />
         <div className="flex-1 min-w-0">
-          <p
-            className="text-xs font-semibold"
-            style={{ color: everChecked && !checkPassed ? 'var(--color-danger)' : 'var(--color-success)' }}
-          >
-            {everChecked && !checkPassed ? 'Hash Mismatch Detected' : 'Anchored on Blockchain'}
+          <p className="text-xs font-semibold" style={{ color: panelColor }}>
+            {staleReceipt
+              ? 'Anchor Receipt Stale — Reconciliation Required'
+              : failedIntegrity
+                ? 'Hash Mismatch Detected'
+                : 'Anchored on Blockchain'}
           </p>
           <p className="text-xs mt-0.5 font-mono truncate" style={{ color: 'var(--color-text-2)' }}>
             Hash: {hashPreview}
@@ -764,18 +844,13 @@ function BlockchainStatusPanel({ status, onVerify, onAnchor, verifying, anchorin
             </p>
           )}
           {status.blockNumber != null && (
-            <p className="text-xs" style={{ color: 'var(--color-muted)' }}>
-              Block #{status.blockNumber}
-            </p>
+            <p className="text-xs" style={{ color: 'var(--color-muted)' }}>Block #{status.blockNumber}</p>
           )}
           <p className="text-xs" style={{ color: 'var(--color-muted)' }}>
-            Anchored {fmtDate(status.anchoredAt)}
+            Recorded {fmtDate(status.anchoredAt)}
           </p>
           {everChecked && (
-            <p
-              className="text-xs mt-1 font-medium"
-              style={{ color: checkPassed ? 'var(--color-success)' : 'var(--color-danger)' }}
-            >
+            <p className="text-xs mt-1 font-medium" style={{ color: checkPassed ? 'var(--color-success)' : 'var(--color-danger)' }}>
               {checkPassed ? '✓ Integrity verified' : '✗ Data may have been altered'}
               {' · '}{fmtDate(status.lastCheckedAt)}
             </p>
@@ -783,17 +858,18 @@ function BlockchainStatusPanel({ status, onVerify, onAnchor, verifying, anchorin
         </div>
       </div>
       <button
+        type="button"
         onClick={onVerify}
-        disabled={verifying}
-        className="flex items-center justify-center gap-2 w-full h-9 px-4 rounded-xl text-xs font-semibold border transition-all"
+        disabled={verifying || staleReceipt}
+        className="flex items-center justify-center gap-2 w-full h-9 px-4 rounded-xl text-xs font-semibold border transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2"
         style={{
           borderColor: 'var(--color-border)',
-          color: verifying ? 'var(--color-muted)' : 'var(--color-text-1)',
+          color: verifying || staleReceipt ? 'var(--color-muted)' : 'var(--color-text-1)',
           background: 'white',
-          opacity: verifying ? 0.6 : 1,
-          cursor: verifying ? 'not-allowed' : 'pointer',
+          opacity: verifying || staleReceipt ? 0.6 : 1,
+          cursor: verifying || staleReceipt ? 'not-allowed' : 'pointer',
         }}
-        onMouseEnter={(e) => { if (!verifying) e.currentTarget.style.filter = 'brightness(0.97)'; }}
+        onMouseEnter={(e) => { if (!verifying && !staleReceipt) e.currentTarget.style.filter = 'brightness(0.97)'; }}
         onMouseLeave={(e) => { e.currentTarget.style.filter = 'brightness(1)'; }}
       >
         {verifying

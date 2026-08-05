@@ -313,7 +313,7 @@ export default function ApplicantDetailPage() {
   useEffect(() => {
     if (!applicant) return;
     if (previousStatusRef.current === 'PARTIAL' && applicant.status === 'COMPLETE') {
-      showToast('Profile is now Complete! Anchoring to blockchain…', 'success');
+      showToast('Profile complete. Blockchain sync queued.', 'success');
     }
     previousStatusRef.current = applicant.status;
   }, [applicant?.status]);
@@ -488,7 +488,7 @@ export default function ApplicantDetailPage() {
     <div className="animate-fade-up">
       {/* Toast */}
       {toast && (
-        <div className={cn(
+        <div role="status" aria-live="polite" className={cn(
           'fixed bottom-5 right-5 z-50 px-4 py-3 rounded-xl shadow-lg text-sm font-medium max-w-sm',
           toast.type === 'success' ? 'bg-green-600 text-white' : 'bg-slate-800 text-white',
         )}>

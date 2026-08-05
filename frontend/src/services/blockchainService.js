@@ -31,3 +31,26 @@ export async function simulateTamper(idNumber, field) {
   const { data } = await api.get(`/blockchain/simulate-tamper/${idNumber}`, { params: { field } });
   return data;
 }
+
+export async function getBlockchainSyncStatus() {
+  const { data } = await api.get('/blockchain/sync-status');
+  return data;
+}
+
+export async function retryBlockchainOperation(operationId) {
+  const { data } = await api.post(`/blockchain/sync/${encodeURIComponent(operationId)}/retry`);
+  return data;
+}
+
+export async function scanBlockchainReconciliation() {
+  const { data } = await api.post('/blockchain/reconcile', { mode: 'SCAN' });
+  return data;
+}
+
+export async function applyBlockchainReconciliation(expectedObservedEpoch) {
+  const { data } = await api.post('/blockchain/reconcile', {
+    mode: 'APPLY',
+    expectedObservedEpoch,
+  });
+  return data;
+}
