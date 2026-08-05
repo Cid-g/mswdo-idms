@@ -8,7 +8,8 @@ integrity re-verification, and an atomic compare-and-swap persistence service. P
 added the fail-closed HTTP boundary for `POST /internal/sync`, and Phase 2A.3b added the
 MongoDB-backed executable lifecycle. Phase 2A.4a adds a separately domain-separated, signed
 source-health heartbeat, and Phase 2A.4b adds the public `GET /check?token=...` decision
-boundary. The existing local backend/frontend remain unchanged.
+boundary, and Phase 2A.5 adds bounded in-process per-IP, per-token, and service-wide
+rate limits. The existing local backend/frontend remain unchanged.
 
 ## Record-sync envelope (protocol v1)
 
@@ -129,6 +130,11 @@ directly; it does not load `.env` files automatically.
 - Existing protocol variables control audience, record-sync path, signed-health path, and replay window.
 - `VERIFY_CHECK_PATH` — public verification endpoint, default `/check`.
 - `VERIFY_MAX_SYNC_AGE_MS` — maximum age of a drained-queue heartbeat before ACTIVE becomes UNKNOWN; default 300000 ms.
+- `VERIFY_RATE_LIMIT_WINDOW_MS` — fixed public-check window; default 60000 ms.
+- `VERIFY_RATE_LIMIT_IP_MAX` — maximum `/check` requests per socket IP per window; default 30.
+- `VERIFY_RATE_LIMIT_TOKEN_MAX` — maximum checks of one hashed token per window; default 10.
+- `VERIFY_RATE_LIMIT_GLOBAL_MAX` — per-process public-check ceiling per window; default 600.
+- `VERIFY_RATE_LIMIT_MAX_KEYS` — memory bound for live IP/token counters; default 10000.
 
 The office Ed25519 private key must never be copied into this cloud application. Start the
 receiver after setting real environment values:
@@ -177,5 +183,19 @@ Results are evaluated in this order:
 The response exposes only the minimized signed projection, scoped issuance receipt, sync and
 health timestamps, and verification time. It never exposes raw tokens, canonical hashes, full
 identity data, or revocation reasons. Public responses use `no-store, private`, no-referrer,
-noindex/nofollow, and restrictive content headers. Layered per-IP, per-token, and service-wide
-rate limiting remains a separate security-hardening gate before public deployment.
+noindex/nofollow, and restrictive content headers.
+
+## Public abuse controls
+
+`GET /check` is protected before MongoDB lookup by three fixed-window layers:
+
+1. a per-process service ceiling;
+2. a per-socket-IP ceiling, including malformed check queries;
+3. a per-token ceiling keyed only by the SHA-256 token hash.
+
+Limited responses return a token-redacted `429` with `Retry-After`, no-store, and noindex
+headers. Counter maps are memory-bounded and fail closed for new keys while all slots are live.
+The service deliberately does not trust `X-Forwarded-For` or similar client-supplied headers;
+it uses the TCP socket address. In production, the trusted hosting edge/WAF must additionally
+enforce distributed client-IP and service-wide limits, because in-process counters are not
+shared across replicas and a reverse proxy may be the socket peer seen by Node.js.

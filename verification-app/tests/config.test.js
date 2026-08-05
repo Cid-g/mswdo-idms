@@ -9,6 +9,11 @@ const {
   DEFAULT_MAX_CLOCK_SKEW_MS,
   DEFAULT_MAX_SYNC_AGE_MS,
   DEFAULT_PROTOCOL_AUDIENCE,
+  DEFAULT_RATE_LIMIT_GLOBAL_MAX,
+  DEFAULT_RATE_LIMIT_IP_MAX,
+  DEFAULT_RATE_LIMIT_MAX_KEYS,
+  DEFAULT_RATE_LIMIT_TOKEN_MAX,
+  DEFAULT_RATE_LIMIT_WINDOW_MS,
   DEFAULT_SYNC_PATH,
   loadProtocolConfig,
   loadPublicVerificationConfig,
@@ -42,6 +47,13 @@ test('loads public verification defaults and explicit freshness settings', () =>
   assert.deepEqual(loadPublicVerificationConfig({}), {
     checkPath: DEFAULT_CHECK_PATH,
     maxSyncAgeMs: DEFAULT_MAX_SYNC_AGE_MS,
+    rateLimit: {
+      globalMax: DEFAULT_RATE_LIMIT_GLOBAL_MAX,
+      ipMax: DEFAULT_RATE_LIMIT_IP_MAX,
+      maxKeys: DEFAULT_RATE_LIMIT_MAX_KEYS,
+      tokenMax: DEFAULT_RATE_LIMIT_TOKEN_MAX,
+      windowMs: DEFAULT_RATE_LIMIT_WINDOW_MS,
+    },
   });
 
   const protocol = loadProtocolConfig({
@@ -51,9 +63,21 @@ test('loads public verification defaults and explicit freshness settings', () =>
   assert.deepEqual(loadPublicVerificationConfig({
     VERIFY_CHECK_PATH: '/v1/check',
     VERIFY_MAX_SYNC_AGE_MS: '120000',
+    VERIFY_RATE_LIMIT_GLOBAL_MAX: '900',
+    VERIFY_RATE_LIMIT_IP_MAX: '40',
+    VERIFY_RATE_LIMIT_MAX_KEYS: '12000',
+    VERIFY_RATE_LIMIT_TOKEN_MAX: '12',
+    VERIFY_RATE_LIMIT_WINDOW_MS: '90000',
   }, protocol), {
     checkPath: '/v1/check',
     maxSyncAgeMs: 120000,
+    rateLimit: {
+      globalMax: 900,
+      ipMax: 40,
+      maxKeys: 12000,
+      tokenMax: 12,
+      windowMs: 90000,
+    },
   });
 });
 
@@ -82,6 +106,16 @@ test('rejects unsafe public verification configuration', () => {
     () => loadPublicVerificationConfig({ VERIFY_MAX_SYNC_AGE_MS: '86400001' }),
     /positive safe integer/,
   );
+  for (const env of [
+    { VERIFY_RATE_LIMIT_WINDOW_MS: '0' },
+    { VERIFY_RATE_LIMIT_WINDOW_MS: '3600001' },
+    { VERIFY_RATE_LIMIT_IP_MAX: '0' },
+    { VERIFY_RATE_LIMIT_TOKEN_MAX: '1.5' },
+    { VERIFY_RATE_LIMIT_GLOBAL_MAX: '1000001' },
+    { VERIFY_RATE_LIMIT_MAX_KEYS: '-1' },
+  ]) {
+    assert.throws(() => loadPublicVerificationConfig(env), /positive safe integer/);
+  }
 });
 
 test('rejects malformed protocol configuration', () => {
@@ -129,6 +163,13 @@ test('loads fail-closed runtime configuration and validates Ed25519 public keys 
   assert.deepEqual(config.publicVerification, {
     checkPath: DEFAULT_CHECK_PATH,
     maxSyncAgeMs: DEFAULT_MAX_SYNC_AGE_MS,
+    rateLimit: {
+      globalMax: DEFAULT_RATE_LIMIT_GLOBAL_MAX,
+      ipMax: DEFAULT_RATE_LIMIT_IP_MAX,
+      maxKeys: DEFAULT_RATE_LIMIT_MAX_KEYS,
+      tokenMax: DEFAULT_RATE_LIMIT_TOKEN_MAX,
+      windowMs: DEFAULT_RATE_LIMIT_WINDOW_MS,
+    },
   });
   assert.equal(config.publicKeys['office-key-1'].asymmetricKeyType, 'ed25519');
   assert.equal(Object.isFrozen(config), true);
@@ -142,6 +183,11 @@ test('accepts explicit cloud listener and MongoDB lifecycle settings', () => {
     MONGODB_URI: 'mongodb+srv://cluster.example/verification',
     VERIFY_CHECK_PATH: '/v1/check',
     VERIFY_MAX_SYNC_AGE_MS: '180000',
+    VERIFY_RATE_LIMIT_GLOBAL_MAX: '700',
+    VERIFY_RATE_LIMIT_IP_MAX: '35',
+    VERIFY_RATE_LIMIT_MAX_KEYS: '9000',
+    VERIFY_RATE_LIMIT_TOKEN_MAX: '11',
+    VERIFY_RATE_LIMIT_WINDOW_MS: '45000',
     VERIFY_MONGODB_DATABASE: 'verification_staging',
     VERIFY_MONGO_SERVER_SELECTION_TIMEOUT_MS: '4500',
     VERIFY_PUBLIC_KEYS: JSON.stringify({ key_2026: publicKeyPem() }),
@@ -153,7 +199,17 @@ test('accepts explicit cloud listener and MongoDB lifecycle settings', () => {
     port: 0,
     shutdownGraceMs: 2500,
   });
-  assert.deepEqual(config.publicVerification, { checkPath: '/v1/check', maxSyncAgeMs: 180000 });
+  assert.deepEqual(config.publicVerification, {
+    checkPath: '/v1/check',
+    maxSyncAgeMs: 180000,
+    rateLimit: {
+      globalMax: 700,
+      ipMax: 35,
+      maxKeys: 9000,
+      tokenMax: 11,
+      windowMs: 45000,
+    },
+  });
   assert.deepEqual(config.mongo, {
     databaseName: 'verification_staging',
     serverSelectionTimeoutMs: 4500,

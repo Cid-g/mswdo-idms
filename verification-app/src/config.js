@@ -1,6 +1,13 @@
 'use strict';
 
 const { getEd25519PublicKey } = require('./crypto/signatureVerifier');
+const {
+  DEFAULT_RATE_LIMIT_GLOBAL_MAX,
+  DEFAULT_RATE_LIMIT_IP_MAX,
+  DEFAULT_RATE_LIMIT_MAX_KEYS,
+  DEFAULT_RATE_LIMIT_TOKEN_MAX,
+  DEFAULT_RATE_LIMIT_WINDOW_MS,
+} = require('./services/publicRateLimiter');
 
 const DEFAULT_PROTOCOL_AUDIENCE = 'mswdo-verification-service';
 const DEFAULT_SYNC_PATH = '/internal/sync';
@@ -171,6 +178,38 @@ function loadPublicVerificationConfig(env = process.env, protocolConfig = loadPr
       'VERIFY_MAX_SYNC_AGE_MS',
       { max: 24 * 60 * 60 * 1000 },
     ),
+    rateLimit: Object.freeze({
+      globalMax: parsePositiveSafeInteger(
+        env.VERIFY_RATE_LIMIT_GLOBAL_MAX,
+        DEFAULT_RATE_LIMIT_GLOBAL_MAX,
+        'VERIFY_RATE_LIMIT_GLOBAL_MAX',
+        { max: 1_000_000 },
+      ),
+      ipMax: parsePositiveSafeInteger(
+        env.VERIFY_RATE_LIMIT_IP_MAX,
+        DEFAULT_RATE_LIMIT_IP_MAX,
+        'VERIFY_RATE_LIMIT_IP_MAX',
+        { max: 1_000_000 },
+      ),
+      maxKeys: parsePositiveSafeInteger(
+        env.VERIFY_RATE_LIMIT_MAX_KEYS,
+        DEFAULT_RATE_LIMIT_MAX_KEYS,
+        'VERIFY_RATE_LIMIT_MAX_KEYS',
+        { max: 1_000_000 },
+      ),
+      tokenMax: parsePositiveSafeInteger(
+        env.VERIFY_RATE_LIMIT_TOKEN_MAX,
+        DEFAULT_RATE_LIMIT_TOKEN_MAX,
+        'VERIFY_RATE_LIMIT_TOKEN_MAX',
+        { max: 1_000_000 },
+      ),
+      windowMs: parsePositiveSafeInteger(
+        env.VERIFY_RATE_LIMIT_WINDOW_MS,
+        DEFAULT_RATE_LIMIT_WINDOW_MS,
+        'VERIFY_RATE_LIMIT_WINDOW_MS',
+        { max: 60 * 60 * 1000 },
+      ),
+    }),
   });
 }
 
@@ -215,6 +254,11 @@ module.exports = {
   DEFAULT_MONGODB_DATABASE,
   DEFAULT_MONGO_SERVER_SELECTION_TIMEOUT_MS,
   DEFAULT_PROTOCOL_AUDIENCE,
+  DEFAULT_RATE_LIMIT_GLOBAL_MAX,
+  DEFAULT_RATE_LIMIT_IP_MAX,
+  DEFAULT_RATE_LIMIT_MAX_KEYS,
+  DEFAULT_RATE_LIMIT_TOKEN_MAX,
+  DEFAULT_RATE_LIMIT_WINDOW_MS,
   DEFAULT_SHUTDOWN_GRACE_MS,
   DEFAULT_SYNC_PATH,
   KEY_ID_PATTERN,

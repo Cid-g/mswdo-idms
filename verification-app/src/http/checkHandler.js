@@ -4,14 +4,38 @@ const { SourceHealthIntegrityError } = require('../models/sourceHealth');
 const { StoredRecordIntegrityError } = require('../models/verifiedRecord');
 const {
   PublicVerificationError,
+  hashVerificationToken,
+  normalizeVerificationToken,
   verifyPublicToken,
 } = require('../services/publicVerification');
+const {
+  createPublicRateLimiter,
+  getRequestClientIp,
+} = require('../services/publicRateLimiter');
 const { writeJson } = require('./syncHandler');
 
 const PUBLIC_RESPONSE_HEADERS = Object.freeze({
   'Cache-Control': 'no-store, private, max-age=0',
   'X-Robots-Tag': 'noindex, nofollow, noarchive',
 });
+
+function writeRateLimited(res, result) {
+  const retryAfterSeconds = Math.max(1, Math.ceil(result.retryAfterMs / 1000));
+  writeJson(
+    res,
+    429,
+    {
+      error: {
+        code: 'PUBLIC_RATE_LIMITED',
+        message: 'Too many verification requests. Please try again later.',
+      },
+    },
+    {
+      ...PUBLIC_RESPONSE_HEADERS,
+      'Retry-After': String(retryAfterSeconds),
+    },
+  );
+}
 
 function publicCheckError(error) {
   if (error instanceof PublicVerificationError && error.status < 500) {
@@ -67,12 +91,14 @@ function parsePublicToken(requestUrl) {
 
 function validateConstructionOptions({
   collection,
+  getClientIp,
   healthCollection,
   now,
   onError,
   protocolConfig,
   publicConfig,
   publicKeys,
+  rateLimiter,
 }) {
   if (!collection || typeof collection.findOne !== 'function') {
     throw new TypeError('A Mongo-compatible verified-record collection is required.');
@@ -91,25 +117,33 @@ function validateConstructionOptions({
   }
   if (typeof now !== 'function') throw new TypeError('now must be a function.');
   if (typeof onError !== 'function') throw new TypeError('onError must be a function.');
+  if (!rateLimiter || typeof rateLimiter.consumeIngress !== 'function' || typeof rateLimiter.consumeToken !== 'function') {
+    throw new TypeError('rateLimiter must provide consumeIngress and consumeToken.');
+  }
+  if (typeof getClientIp !== 'function') throw new TypeError('getClientIp must be a function.');
 }
 
 function createCheckRequestHandler({
   collection,
+  getClientIp = getRequestClientIp,
   healthCollection,
   now = Date.now,
   onError = () => {},
   protocolConfig,
   publicConfig,
   publicKeys,
+  rateLimiter = createPublicRateLimiter(publicConfig?.rateLimit),
 }) {
   validateConstructionOptions({
     collection,
+    getClientIp,
     healthCollection,
     now,
     onError,
     protocolConfig,
     publicConfig,
     publicKeys,
+    rateLimiter,
   });
 
   return async function checkRequestHandler(req, res) {
@@ -147,15 +181,35 @@ function createCheckRequestHandler({
     }
 
     try {
+      const currentTime = now();
+      const ingressLimit = rateLimiter.consumeIngress({
+        clientIp: getClientIp(req),
+        nowMs: currentTime,
+      });
+      if (!ingressLimit.allowed) {
+        writeRateLimited(res, ingressLimit);
+        return;
+      }
+
       const rawToken = parsePublicToken(requestUrl);
+      const normalizedToken = normalizeVerificationToken(rawToken);
+      const tokenLimit = rateLimiter.consumeToken({
+        nowMs: currentTime,
+        tokenHash: hashVerificationToken(normalizedToken),
+      });
+      if (!tokenLimit.allowed) {
+        writeRateLimited(res, tokenLimit);
+        return;
+      }
+
       const result = await verifyPublicToken({
         collection,
         healthCollection,
         healthPath: protocolConfig.healthPath,
         maxSyncAgeMs: publicConfig.maxSyncAgeMs,
-        now,
+        now: () => currentTime,
         publicKeys,
-        rawToken,
+        rawToken: normalizedToken,
         recordAudience: protocolConfig.audience,
         recordPath: protocolConfig.syncPath,
       });
@@ -180,4 +234,5 @@ module.exports = {
   parsePublicToken,
   publicCheckError,
   validateConstructionOptions,
+  writeRateLimited,
 };

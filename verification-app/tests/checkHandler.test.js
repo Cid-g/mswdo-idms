@@ -7,6 +7,7 @@ const { createVerificationRequestHandler } = require('../src/http/app');
 const { materializeSourceHealth, SOURCE_HEALTH_ID } = require('../src/models/sourceHealth');
 const { materializeVerifiedRecord } = require('../src/models/verifiedRecord');
 const { hashVerificationToken } = require('../src/services/publicVerification');
+const { createPublicRateLimiter } = require('../src/services/publicRateLimiter');
 const {
   AUDIENCE,
   HEALTH_PATH,
@@ -41,12 +42,16 @@ function healthDocument(timestamp = NOW - 10_000) {
 
 async function withApp(run, {
   collection = { async findOne() { return recordDocument(); } },
+  getClientIp,
   healthCollection = { async findOne() { return healthDocument(); } },
   now = () => NOW,
   onError = () => {},
+  publicConfig = { checkPath: '/check', maxSyncAgeMs: 300_000 },
+  rateLimiter,
 } = {}) {
   const handler = createVerificationRequestHandler({
     collection,
+    getClientIp,
     healthCollection,
     now,
     onError,
@@ -56,8 +61,9 @@ async function withApp(run, {
       maxClockSkewMs: 300_000,
       syncPath: PATH,
     },
-    publicConfig: { checkPath: '/check', maxSyncAgeMs: 300_000 },
+    publicConfig,
     publicKeys: { [KEY_ID]: publicKey },
+    rateLimiter,
   });
   const server = http.createServer(handler);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -200,4 +206,104 @@ test('contains unexpected database failures behind a generic public 503', async 
       async findOne() { throw new Error(secret); },
     },
   });
+});
+
+
+test('rate limits repeated public checks before another database read', async () => {
+  let reads = 0;
+  const rateLimiter = createPublicRateLimiter({
+    globalMax: 100,
+    ipMax: 1,
+    maxKeys: 100,
+    tokenMax: 100,
+    windowMs: 60_000,
+  });
+
+  await withApp(async (baseUrl) => {
+    const first = await fetch(`${baseUrl}/check?token=${RAW_TOKEN}`);
+    assert.equal(first.status, 200);
+
+    const second = await fetch(`${baseUrl}/check?token=${RAW_TOKEN}`);
+    assert.equal(second.status, 429);
+    assert.equal(second.headers.get('retry-after'), '60');
+    assert.equal(second.headers.get('cache-control'), 'no-store, private, max-age=0');
+    assert.equal(second.headers.get('x-robots-tag'), 'noindex, nofollow, noarchive');
+    const body = await second.json();
+    assert.equal(body.error.code, 'PUBLIC_RATE_LIMITED');
+    assert.equal(JSON.stringify(body).includes(RAW_TOKEN), false);
+    assert.equal(JSON.stringify(body).includes(TOKEN_HASH), false);
+  }, {
+    collection: {
+      async findOne() {
+        reads += 1;
+        return recordDocument();
+      },
+    },
+    getClientIp: () => '192.0.2.10',
+    rateLimiter,
+  });
+
+  assert.equal(reads, 1);
+});
+
+test('applies the per-token layer across different client IPs using only the token hash', async () => {
+  const observedHashes = [];
+  const baseLimiter = createPublicRateLimiter({
+    globalMax: 100,
+    ipMax: 100,
+    maxKeys: 100,
+    tokenMax: 1,
+    windowMs: 60_000,
+  });
+  const rateLimiter = {
+    consumeIngress: baseLimiter.consumeIngress,
+    consumeToken(input) {
+      observedHashes.push(input.tokenHash);
+      return baseLimiter.consumeToken(input);
+    },
+  };
+  let clientNumber = 0;
+
+  await withApp(async (baseUrl) => {
+    const first = await fetch(`${baseUrl}/check?token=${RAW_TOKEN}`);
+    assert.equal(first.status, 200);
+    const second = await fetch(`${baseUrl}/check?token=${RAW_TOKEN}`);
+    assert.equal(second.status, 429);
+  }, {
+    getClientIp: () => `192.0.2.${++clientNumber}`,
+    rateLimiter,
+  });
+
+  assert.deepEqual(observedHashes, [TOKEN_HASH, TOKEN_HASH]);
+  assert.equal(observedHashes.includes(RAW_TOKEN), false);
+});
+
+test('counts malformed check requests against ingress limits without querying MongoDB', async () => {
+  let reads = 0;
+  const rateLimiter = createPublicRateLimiter({
+    globalMax: 100,
+    ipMax: 1,
+    maxKeys: 100,
+    tokenMax: 100,
+    windowMs: 60_000,
+  });
+
+  await withApp(async (baseUrl) => {
+    const malformed = await fetch(`${baseUrl}/check?token=not-a-uuid`);
+    assert.equal(malformed.status, 400);
+
+    const limited = await fetch(`${baseUrl}/check?token=${RAW_TOKEN}`);
+    assert.equal(limited.status, 429);
+  }, {
+    collection: {
+      async findOne() {
+        reads += 1;
+        return null;
+      },
+    },
+    getClientIp: () => '198.51.100.7',
+    rateLimiter,
+  });
+
+  assert.equal(reads, 0);
 });
