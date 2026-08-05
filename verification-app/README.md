@@ -2,10 +2,11 @@
 
 This directory contains the independently hosted public-verification service.
 
-Phase 2A.1 established the signed record-sync protocol. Phase 2A.2 adds the exact minimized
+Phase 2A.1 established the signed record-sync protocol. Phase 2A.2 added the exact minimized
 record schema, deterministic materialization from verified signed bytes, stored-record
-integrity re-verification, and an atomic compare-and-swap persistence service. It still does
-not start an HTTP server, connect to MongoDB, or change the existing local backend/frontend.
+integrity re-verification, and an atomic compare-and-swap persistence service. Phase 2A.3a
+adds the fail-closed HTTP boundary for `POST /internal/sync`. It still does not connect to a
+real MongoDB deployment, start a production listener, or change the existing local backend/frontend.
 
 ## Record-sync envelope (protocol v1)
 
@@ -55,6 +56,27 @@ compare-and-swap boundary:
 Every public read will later call `assertStoredRecordIntegrity()`, which re-verifies the old
 Ed25519 signature without applying the short incoming-request replay window, re-parses the
 canonical envelope, and compares all materialized fields with signed truth.
+
+
+## Internal sync HTTP boundary
+
+The endpoint accepts the canonical signed envelope itself as the exact UTF-8 request body.
+The signature and envelope bindings travel in exactly one instance of each header:
+
+- `Content-Type: application/json` (optional `charset=utf-8`);
+- `X-Key-Id`;
+- `X-Timestamp`;
+- `X-Signature`.
+
+Compressed bodies, duplicate security headers, query strings, non-canonical envelopes,
+invalid UTF-8, and bodies over the signed-envelope limit are rejected before persistence.
+Successful acknowledgements expose only outcome, epoch, revision, and payload digest. All
+responses use `no-store` and restrictive security headers. Unexpected persistence failures
+return a generic `503` without reflecting database errors, credentials, signed bytes, or
+record contents.
+
+The handler is dependency-injected with a Mongo-compatible collection. The next isolated
+slice will add the official MongoDB driver, index-before-listen startup, and graceful shutdown.
 
 ## Security invariants
 
