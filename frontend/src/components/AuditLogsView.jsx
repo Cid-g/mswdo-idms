@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { format } from 'date-fns';
 import {
@@ -155,7 +155,7 @@ export default function AuditLogsView({ isSuperAdmin, user }) {
           ? 'linear-gradient(135deg, #881337 0%, #9F1239 60%, #BE123C 100%)'
           : 'linear-gradient(135deg, #78350F 0%, #92400E 60%, #B45309 100%)');
 
-  const params = {
+  const params = useMemo(() => ({
     page,
     limit: PAGE_SIZE,
     ...(isSuperAdmin && department ? { department } : {}),
@@ -165,7 +165,7 @@ export default function AuditLogsView({ isSuperAdmin, user }) {
     ...(search     ? { search }     : {}),
     ...(from ? { from } : {}),
     ...(to   ? { to }   : {}),
-  };
+  }), [page, isSuperAdmin, department, userId, action, targetType, search, from, to]);
 
   const { data, isLoading, isError } = useQuery({
     queryKey: ['audit-logs', params],

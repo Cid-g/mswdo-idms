@@ -74,7 +74,11 @@ export default function TopBar() {
   }
 
   async function handleLogout() {
-    try { await api.post('/auth/logout', { refreshToken }); } catch (_) {}
+    try {
+      await api.post('/auth/logout', { refreshToken });
+    } catch {
+      // Server logout is best-effort; local logout must still complete.
+    }
     logout();
     navigate('/login', { replace: true });
   }

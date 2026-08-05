@@ -1,5 +1,5 @@
 import { useState, useRef } from 'react';
-import { useForm } from 'react-hook-form';
+import { useForm, useWatch } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { Eye, EyeOff, Lock, Loader2, Camera, User } from 'lucide-react';
@@ -119,7 +119,7 @@ export default function AccountSettingsPage() {
   const {
     register,
     handleSubmit,
-    watch,
+    control,
     reset,
     setError,
     formState: { errors, isSubmitting },
@@ -128,7 +128,7 @@ export default function AccountSettingsPage() {
     defaultValues: { currentPassword: '', newPassword: '', confirmPassword: '' },
   });
 
-  const newPassword = watch('newPassword');
+  const newPassword = useWatch({ control, name: 'newPassword', defaultValue: '' });
   const strength    = getStrength(newPassword);
 
   async function onPasswordSubmit(data) {

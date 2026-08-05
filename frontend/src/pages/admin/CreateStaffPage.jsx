@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useForm } from 'react-hook-form';
+import { useForm, useWatch } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { Eye, EyeOff, ArrowLeft, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
@@ -69,7 +69,7 @@ export default function CreateStaffPage() {
   const {
     register,
     handleSubmit,
-    watch,
+    control,
     getValues,
     setValue,
     setError,
@@ -97,7 +97,7 @@ export default function CreateStaffPage() {
   const firstNameRegistration = register('firstName');
   const lastNameRegistration = register('lastName');
 
-  const password = watch('password');
+  const password = useWatch({ control, name: 'password', defaultValue: '' });
   const strength = getStrength(password);
 
   async function onSubmit(data) {

@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   ArrowLeft, Save, Eye, Type, Image as ImageIcon,
@@ -398,7 +398,10 @@ export default function TemplatePlacerEditor() {
 
   const templateDept = template?.department ?? 'PWD';
   const templateSide = side;
-  const defs         = PLACEHOLDERS[templateDept]?.[templateSide] ?? [];
+  const defs = useMemo(
+    () => PLACEHOLDERS[templateDept]?.[templateSide] ?? [],
+    [templateDept, templateSide],
+  );
   const theme        = {
     PWD:            { accent: '#1E40AF' },
     SOLO_PARENT:    { accent: '#9F1239' },
@@ -1051,7 +1054,7 @@ export default function TemplatePlacerEditor() {
                   return (
                     <button
                       key={def.key}
-                      onClick={() => { togglePlaceholder(def.key); if (on) {} else setSelected(def.key); }}
+                      onClick={() => { togglePlaceholder(def.key); if (!on) setSelected(def.key); }}
                       className="flex items-center justify-between w-full px-3 py-2.5 rounded-lg text-left transition-all"
                       style={{
                         background: on ? 'white' : 'transparent',
