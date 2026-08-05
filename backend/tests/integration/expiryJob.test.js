@@ -8,6 +8,7 @@ const BlockchainAnchor = require('../../src/models/BlockchainAnchor');
 const ChainOutbox = require('../../src/models/ChainOutbox');
 const IDRecord = require('../../src/models/IDRecord');
 const JobLease = require('../../src/models/JobLease');
+const VerifyOutbox = require('../../src/models/VerifyOutbox');
 const {
   runExpiryJobOnce,
   startExpiryJob,
@@ -24,6 +25,7 @@ beforeAll(async () => {
     BlockchainAnchor.syncIndexes(),
     ChainOutbox.syncIndexes(),
     JobLease.syncIndexes(),
+    VerifyOutbox.syncIndexes(),
   ]);
 });
 
@@ -55,10 +57,24 @@ async function createRecord({
   expiryDate = PAST_DUE,
   chainSequence = 0,
   suffix = new mongoose.Types.ObjectId().toString(),
-  applicantId = new mongoose.Types.ObjectId(),
+  applicantId,
 } = {}) {
+  let resolvedApplicantId = applicantId;
+  if (!resolvedApplicantId) {
+    const applicant = await Applicant.create({
+      department,
+      encodedById: new mongoose.Types.ObjectId(),
+      firstName: 'Expiry',
+      lastName: `Record ${suffix}`,
+      birthdate: new Date('1990-01-01T00:00:00.000Z'),
+      barangay: 'Poblacion 1',
+      status: 'COMPLETE',
+    });
+    resolvedApplicantId = applicant._id;
+  }
+
   return IDRecord.create({
-    applicantId,
+    applicantId: resolvedApplicantId,
     department,
     idNumber: `${department}-${suffix}`,
     qrToken: `expiry-token-${suffix}`,
@@ -74,7 +90,7 @@ async function addAnchorReceipt(record) {
     idRecordId: record._id,
     recordRef: record.idNumber,
     canonicalHash: 'a'.repeat(64),
-    txId: `tx-${record._id}`,
+    txId: String(record._id).padEnd(64, '0'),
     blockNumber: 42,
     ledgerEpoch: 'expiry-ledger-epoch',
   });
@@ -115,6 +131,46 @@ async function expectPendingExpire(record, expectedSequence) {
   });
 }
 
+async function expectPendingVerificationExpire(record, { hasReceipt }) {
+  const operation = await VerifyOutbox.findOne({
+    operationId: `verify:expire:${record._id}`,
+  }).lean();
+
+  expect(operation).toMatchObject({
+    idRecordId: record._id,
+    epoch: 1,
+    revision: 1,
+    state: 'PENDING',
+    attempts: 0,
+    payload: {
+      expiryDate: '2026-08-04',
+      idNumber: record.idNumber,
+      idType: record.department,
+      issuedDate: '2025-08-05',
+      releasedAt: null,
+      status: 'EXPIRED',
+    },
+  });
+  expect(operation.tokenHash).toMatch(/^[a-f0-9]{64}$/);
+  expect(JSON.stringify(operation)).not.toContain(record.qrToken);
+
+  if (hasReceipt) {
+    expect(operation.payload).toMatchObject({
+      anchoredAt: expect.any(String),
+      anchoredHash: 'a'.repeat(64),
+      blockNumber: 42,
+      txId: String(record._id).padEnd(64, '0'),
+    });
+  } else {
+    expect(operation.payload).toMatchObject({
+      anchoredAt: null,
+      anchoredHash: null,
+      blockNumber: null,
+      txId: null,
+    });
+  }
+}
+
 describe('daily leased expiry job', () => {
   test('allows one lease owner to run while a concurrent owner skips', async () => {
     const record = await createRecord({ suffix: 'lease-race' });
@@ -144,6 +200,7 @@ describe('daily leased expiry job', () => {
     releaseExpiryUpdate.resolve();
     await expect(firstRun).resolves.toMatchObject({ acquired: true, expired: 1, queued: 1 });
     await expectPendingExpire(record, 1);
+    await expectPendingVerificationExpire(record, { hasReceipt: true });
   });
 
   test('expires an anchored past-due ACTIVE ID and queues EXPIRE atomically', async () => {
@@ -156,7 +213,9 @@ describe('daily leased expiry job', () => {
     const persisted = await IDRecord.findById(record._id).lean();
     expect(persisted.status).toBe('EXPIRED');
     expect(persisted.chainSequence).toBe(1);
+    expect(persisted.verifyRevision).toBe(1);
     await expectPendingExpire(record, 1);
+    await expectPendingVerificationExpire(record, { hasReceipt: true });
   });
 
   test('keeps a pending ANCHOR as sequence one and queues EXPIRE as sequence two', async () => {
@@ -170,7 +229,9 @@ describe('daily leased expiry job', () => {
     expect(persisted.status).toBe('EXPIRED');
     expect(persisted.chainSequence).toBe(2);
     expect((await ChainOutbox.findById(anchor._id).lean()).sequence).toBe(1);
+    expect(persisted.verifyRevision).toBe(1);
     await expectPendingExpire(record, 2);
+    await expectPendingVerificationExpire(record, { hasReceipt: false });
   });
 
   test('expires an unanchored PARTIAL card locally without queueing an impossible EXPIRE', async () => {
@@ -194,7 +255,9 @@ describe('daily leased expiry job', () => {
     const persisted = await IDRecord.findById(record._id).lean();
     expect(persisted.status).toBe('EXPIRED');
     expect(persisted.chainSequence).toBe(0);
+    expect(persisted.verifyRevision).toBe(1);
     expect(await ChainOutbox.countDocuments({ idRecordId: record._id })).toBe(0);
+    await expectPendingVerificationExpire(record, { hasReceipt: false });
   });
 
   test('ignores Senior Citizen IDs whose expiryDate is null', async () => {
@@ -210,6 +273,7 @@ describe('daily leased expiry job', () => {
     expect(result).toEqual({ acquired: true, expired: 0, queued: 0 });
     expect((await IDRecord.findById(record._id).lean()).status).toBe('ACTIVE');
     expect(await ChainOutbox.countDocuments({ idRecordId: record._id })).toBe(0);
+    expect(await VerifyOutbox.countDocuments({ idRecordId: record._id })).toBe(0);
   });
 
   test('rolls back expiry when enqueue fails so a later scan can rediscover it', async () => {
@@ -223,7 +287,9 @@ describe('daily leased expiry job', () => {
     let persisted = await IDRecord.findById(record._id).lean();
     expect(persisted.status).toBe('ACTIVE');
     expect(persisted.chainSequence).toBe(0);
+    expect(persisted.verifyRevision).toBe(0);
     expect(await ChainOutbox.countDocuments({ idRecordId: record._id })).toBe(0);
+    expect(await VerifyOutbox.countDocuments({ idRecordId: record._id })).toBe(0);
 
     jest.restoreAllMocks();
     await expect(runExpiryJobOnce({ owner: 'expiry-rollback-b', now: NOW }))
@@ -231,7 +297,26 @@ describe('daily leased expiry job', () => {
 
     persisted = await IDRecord.findById(record._id).lean();
     expect(persisted.status).toBe('EXPIRED');
+    expect(persisted.verifyRevision).toBe(1);
     await expectPendingExpire(record, 1);
+    await expectPendingVerificationExpire(record, { hasReceipt: true });
+  });
+
+  test('rolls back local and Fabric expiry intent when verification enqueue fails', async () => {
+    const record = await createRecord({ suffix: 'verification-rollback' });
+    await addAnchorReceipt(record);
+    jest.spyOn(VerifyOutbox, 'create')
+      .mockRejectedValueOnce(new Error('forced verification expiry enqueue failure'));
+
+    await expect(runExpiryJobOnce({ owner: 'expiry-verification-rollback', now: NOW }))
+      .rejects.toThrow('forced verification expiry enqueue failure');
+
+    const persisted = await IDRecord.findById(record._id).lean();
+    expect(persisted.status).toBe('ACTIVE');
+    expect(persisted.chainSequence).toBe(0);
+    expect(persisted.verifyRevision).toBe(0);
+    expect(await ChainOutbox.countDocuments({ idRecordId: record._id })).toBe(0);
+    expect(await VerifyOutbox.countDocuments({ idRecordId: record._id })).toBe(0);
   });
 
   test('does not overwrite REVOKED when revocation wins after candidate discovery', async () => {
@@ -264,6 +349,7 @@ describe('daily leased expiry job', () => {
       idRecordId: record._id,
       operation: 'EXPIRE',
     })).toBe(0);
+    expect(await VerifyOutbox.countDocuments({ idRecordId: record._id })).toBe(0);
   });
 
   test('uses the same non-overlapping runner for the immediate boot run and interval runs', async () => {

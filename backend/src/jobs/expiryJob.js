@@ -2,12 +2,18 @@
 
 const crypto = require('node:crypto');
 
+const Applicant = require('../models/Applicant');
 const BlockchainAnchor = require('../models/BlockchainAnchor');
 const ChainOutbox = require('../models/ChainOutbox');
 const IDRecord = require('../models/IDRecord');
 const JobLease = require('../models/JobLease');
 const { withMongoTransaction } = require('../lib/transactions');
 const { enqueueChainOp, operationIdFor } = require('../services/chainOutbox');
+const { buildVerificationPayload } = require('../services/verificationProjection');
+const {
+  enqueueVerificationSync,
+  verificationOperationIdFor,
+} = require('../services/verifyOutbox');
 
 const JOB_NAME = 'blockchain-expiry';
 const DEFAULT_LEASE_MS = 5 * 60_000;
@@ -22,6 +28,17 @@ function assertDate(value, fieldName) {
   if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
     throw new TypeError(`${fieldName} must be a valid Date`);
   }
+}
+
+function verificationEpoch() {
+  const raw = process.env.VERIFY_EPOCH ?? '1';
+  const epoch = Number(raw);
+  if (!Number.isSafeInteger(epoch) || epoch < 1) {
+    const error = new Error('VERIFY_EPOCH must be a positive safe integer.');
+    error.code = 'VERIFY_CONFIGURATION_INVALID';
+    throw error;
+  }
+  return epoch;
 }
 
 async function acquireExpiryLease({ owner, now, leaseMs = DEFAULT_LEASE_MS }) {
@@ -87,29 +104,48 @@ async function expireNextDueRecord(now) {
     // discovery. The conditional update is the race boundary.
     if (!expired) return { processed: false, raced: true };
 
-    const anchorReceipt = await BlockchainAnchor
-      .exists({ idRecordId: expired._id })
-      .session(session);
-    const anchorIntent = anchorReceipt
+    const [applicant, anchor] = await Promise.all([
+      Applicant.findById(expired.applicantId).session(session),
+      BlockchainAnchor.findOne({ idRecordId: expired._id }).session(session),
+    ]);
+    if (!applicant) {
+      const error = new Error('Applicant not found while queueing ID expiry verification');
+      error.code = 'VERIFY_APPLICANT_NOT_FOUND';
+      throw error;
+    }
+
+    const anchorIntent = anchor
       ? null
       : await ChainOutbox
         .exists({ idRecordId: expired._id, operation: 'ANCHOR' })
         .session(session);
 
-    if (anchorReceipt || anchorIntent) {
-      const outbox = await enqueueChainOp({
+    let chainOutbox = null;
+    if (anchor || anchorIntent) {
+      chainOutbox = await enqueueChainOp({
         session,
         operationId: operationIdFor('EXPIRE', expired._id),
         operation: 'EXPIRE',
         idRecordId: expired._id,
         payload: Object.freeze({}),
       });
-      return { processed: true, queued: true, idRecordId: expired._id, outboxId: outbox._id };
     }
 
-    // A card that never entered Fabric cannot receive a valid EXPIRE command.
-    // Its local status is still authoritative and is committed.
-    return { processed: true, queued: false, idRecordId: expired._id };
+    const verificationOutbox = await enqueueVerificationSync({
+      session,
+      operationId: verificationOperationIdFor('EXPIRE', expired._id),
+      idRecordId: expired._id,
+      payload: buildVerificationPayload({ applicant, idRecord: expired, anchor }),
+      epoch: verificationEpoch(),
+    });
+
+    return {
+      processed: true,
+      queued: Boolean(chainOutbox),
+      idRecordId: expired._id,
+      outboxId: chainOutbox?._id ?? null,
+      verificationOutboxId: verificationOutbox._id,
+    };
   });
 }
 
