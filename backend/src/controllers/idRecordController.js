@@ -11,6 +11,11 @@ const ChainOutbox       = require('../models/ChainOutbox');
 const { generateIDImage } = require('../services/idGeneration');
 const { withMongoTransaction } = require('../lib/transactions');
 const { buildAnchorPayload, enqueueChainOp, operationIdFor } = require('../services/chainOutbox');
+const { buildVerificationPayload } = require('../services/verificationProjection');
+const {
+  enqueueVerificationSync,
+  verificationOperationIdFor,
+} = require('../services/verifyOutbox');
 const {
   nextPWDIdNumber,
   nextOSCANumber,
@@ -45,6 +50,17 @@ function populateRecord(query) {
     .populate('releasedById',               'firstName lastName')
     .populate('lastReprintById',            'firstName lastName')
     .populate('revokedById',                'firstName lastName');
+}
+
+function verificationEpoch() {
+  const raw = process.env.VERIFY_EPOCH ?? '1';
+  const epoch = Number(raw);
+  if (!Number.isSafeInteger(epoch) || epoch < 1) {
+    const error = new Error('VERIFY_EPOCH must be a positive safe integer.');
+    error.code = 'VERIFY_CONFIGURATION_INVALID';
+    throw error;
+  }
+  return epoch;
 }
 
 function computeExpiryDate(department) {
@@ -199,6 +215,15 @@ async function createIDRecord(req, res, next) {
           });
           created.chainSequence = queued.sequence;
         }
+
+        const verification = await enqueueVerificationSync({
+          session,
+          operationId: verificationOperationIdFor('ISSUE', created._id),
+          idRecordId: created._id,
+          payload: buildVerificationPayload({ applicant, idRecord: created }),
+          epoch: verificationEpoch(),
+        });
+        created.verifyRevision = verification.revision;
 
         return created;
       });

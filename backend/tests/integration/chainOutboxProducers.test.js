@@ -30,6 +30,7 @@ const IDRecord = require('../../src/models/IDRecord');
 const IDTemplate = require('../../src/models/IDTemplate');
 const IDTemplateVersion = require('../../src/models/IDTemplateVersion');
 const ChainOutbox = require('../../src/models/ChainOutbox');
+const VerifyOutbox = require('../../src/models/VerifyOutbox');
 const BlockchainAnchor = require('../../src/models/BlockchainAnchor');
 const AuditLog = require('../../src/models/AuditLog');
 const { withMongoTransaction } = require('../../src/lib/transactions');
@@ -55,7 +56,11 @@ let generatedCounter = 0;
 
 beforeAll(async () => {
   await db.connect();
-  await Promise.all([IDRecord.syncIndexes(), ChainOutbox.syncIndexes()]);
+  await Promise.all([
+    IDRecord.syncIndexes(),
+    ChainOutbox.syncIndexes(),
+    VerifyOutbox.syncIndexes(),
+  ]);
 
   pwdUser = await createTestUser({ username: 'outbox_pwd', role: 'ENCODER', department: 'PWD' });
   soloUser = await createTestUser({ username: 'outbox_solo', role: 'ENCODER', department: 'SOLO_PARENT' });
@@ -96,6 +101,7 @@ afterEach(async () => {
     'idtemplates',
     'idtemplateversions',
     'chainoutboxes',
+    'verifyoutboxes',
     'blockchainanchors',
     'sequences',
     'auditlogs',
@@ -158,6 +164,39 @@ async function createActiveId(applicant, suffix) {
   });
 }
 
+async function expectOnePendingVerification(applicant, idRecord) {
+  const row = await VerifyOutbox.findOne({ idRecordId: idRecord._id }).lean();
+  expect(row).toMatchObject({
+    operationId: `verify:issue:${idRecord._id}`,
+    idRecordId: idRecord._id,
+    epoch: 1,
+    revision: 1,
+    state: 'PENDING',
+    payload: {
+      anchoredAt: null,
+      anchoredHash: null,
+      blockNumber: null,
+      expiryDate: idRecord.expiryDate
+        ? new Date(idRecord.expiryDate).toISOString().slice(0, 10)
+        : null,
+      idNumber: idRecord.idNumber,
+      idType: idRecord.department,
+      issuedDate: new Date(idRecord.issuedDate).toISOString().slice(0, 10),
+      maskedName: 'T***, P*******',
+      releasedAt: null,
+      status: 'ACTIVE',
+      txId: null,
+    },
+  });
+  expect(row.tokenHash).toMatch(/^[a-f0-9]{64}$/);
+  expect(JSON.stringify(row)).not.toContain(idRecord.qrToken);
+  expect(JSON.stringify(row.payload)).not.toContain(applicant.firstName);
+  expect(JSON.stringify(row.payload)).not.toContain(applicant.lastName);
+
+  const persisted = await IDRecord.findById(idRecord._id).lean();
+  expect(persisted.verifyRevision).toBe(1);
+}
+
 async function expectOnePendingAnchor(applicantId, idRecordId) {
   const rows = await ChainOutbox.find({ idRecordId }).lean();
   expect(rows).toHaveLength(1);
@@ -197,6 +236,7 @@ describe('ID creation ANCHOR producer', () => {
     const idRecord = await IDRecord.findOne({ applicantId: applicant._id });
     expect(idRecord).not.toBeNull();
     await expectOnePendingAnchor(applicant._id, idRecord._id);
+    await expectOnePendingVerification(applicant, idRecord);
   });
 
   test('creates a PARTIAL applicant ID without an ANCHOR intent', async () => {
@@ -216,7 +256,35 @@ describe('ID creation ANCHOR producer', () => {
     expect(idRecord).not.toBeNull();
     expect(idRecord.chainSequence).toBe(0);
     expect(await ChainOutbox.countDocuments()).toBe(0);
+    await expectOnePendingVerification(applicant, idRecord);
     expect(anchorIDOnChain).not.toHaveBeenCalled();
+  });
+
+  test('rolls back ID issuance, ANCHOR intent, assigned number, and images when verification enqueue fails', async () => {
+    await installTemplate('SENIOR_CITIZEN', seniorUser._id);
+    const applicant = await Applicant.create(baseApplicant({
+      department: 'SENIOR_CITIZEN',
+      encodedById: seniorUser._id,
+      status: 'COMPLETE',
+      photoPath: 'photos/existing.png',
+      signaturePath: 'signatures/existing.png',
+    }));
+    jest.spyOn(VerifyOutbox, 'create')
+      .mockRejectedValueOnce(new Error('forced verification enqueue failure'));
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await supertest(app)
+      .post('/api/id-records')
+      .set('Authorization', `Bearer ${seniorToken}`)
+      .send({ applicantId: applicant._id.toString() });
+
+    expect(res.status).toBe(500);
+    expect(await IDRecord.countDocuments({ applicantId: applicant._id })).toBe(0);
+    expect(await ChainOutbox.countDocuments()).toBe(0);
+    expect(await VerifyOutbox.countDocuments()).toBe(0);
+    const persisted = await Applicant.findById(applicant._id).lean();
+    expect(persisted.seniorCitizen?.oscaNumber).toBeUndefined();
+    expect(fs.existsSync(path.join(IDS_DIR, 'task7-generated-1.png'))).toBe(false);
   });
 
   test('rolls back a newly assigned OSCA number with the ID when enqueue fails', async () => {
