@@ -1,11 +1,14 @@
 'use strict';
 
+const { DEFAULT_LIVENESS_PATH } = require('../config');
+const { createCheckRequestHandler } = require('./checkHandler');
 const { createHealthRequestHandler } = require('./healthHandler');
 const { createSyncRequestHandler, writeJson } = require('./syncHandler');
 
-const HEALTH_PATH = '/healthz';
+const HEALTH_PATH = DEFAULT_LIVENESS_PATH;
 
 function createVerificationRequestHandler(options) {
+  const checkHandler = createCheckRequestHandler(options);
   const syncHandler = createSyncRequestHandler({ ...options, collection: options.collection });
   const healthHandler = createHealthRequestHandler({ ...options, collection: options.healthCollection });
 
@@ -41,6 +44,11 @@ function createVerificationRequestHandler(options) {
       }
 
       writeJson(res, 200, { status: 'ok' });
+      return;
+    }
+
+    if (requestUrl.pathname === options.publicConfig.checkPath) {
+      await checkHandler(req, res);
       return;
     }
 

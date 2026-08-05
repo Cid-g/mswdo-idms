@@ -181,6 +181,7 @@ async function startVerificationServer({
       now,
       onError: (error) => logOperationalError(logger, 'sync request', error),
       protocolConfig: config.protocol,
+      publicConfig: config.publicVerification,
       publicKeys: config.publicKeys,
     });
     const requestListener = createSafeRequestListener(

@@ -5,7 +5,10 @@ const { getEd25519PublicKey } = require('./crypto/signatureVerifier');
 const DEFAULT_PROTOCOL_AUDIENCE = 'mswdo-verification-service';
 const DEFAULT_SYNC_PATH = '/internal/sync';
 const DEFAULT_HEALTH_PATH = '/internal/health';
+const DEFAULT_CHECK_PATH = '/check';
+const DEFAULT_LIVENESS_PATH = '/healthz';
 const DEFAULT_MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
+const DEFAULT_MAX_SYNC_AGE_MS = 5 * 60 * 1000;
 const DEFAULT_HTTP_HOST = '0.0.0.0';
 const DEFAULT_HTTP_PORT = 3002;
 const DEFAULT_MONGODB_DATABASE = 'mswdo_verification';
@@ -15,6 +18,19 @@ const MAX_PUBLIC_KEY_RING_BYTES = 64 * 1024;
 const MAX_PUBLIC_KEYS = 20;
 const KEY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const DATABASE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+function parseAbsolutePath(value, fallback, name) {
+  const path = value === undefined || value === '' ? fallback : value;
+  if (
+    typeof path !== 'string'
+    || !path.startsWith('/')
+    || path.includes('?')
+    || path !== path.trim()
+  ) {
+    throw new Error(`${name} must be an absolute HTTP path without a query string.`);
+  }
+  return path;
+}
 
 function parsePositiveSafeInteger(value, fallback, name, { max = Number.MAX_SAFE_INTEGER } = {}) {
   if (value === undefined || value === '') return fallback;
@@ -112,31 +128,18 @@ function loadPublicKeyRing(value) {
 
 function loadProtocolConfig(env = process.env) {
   const audience = env.VERIFY_PROTOCOL_AUDIENCE || DEFAULT_PROTOCOL_AUDIENCE;
-  const syncPath = env.VERIFY_SYNC_PATH || DEFAULT_SYNC_PATH;
-  const healthPath = env.VERIFY_HEALTH_PATH || DEFAULT_HEALTH_PATH;
+  const syncPath = parseAbsolutePath(env.VERIFY_SYNC_PATH, DEFAULT_SYNC_PATH, 'VERIFY_SYNC_PATH');
+  const healthPath = parseAbsolutePath(env.VERIFY_HEALTH_PATH, DEFAULT_HEALTH_PATH, 'VERIFY_HEALTH_PATH');
 
   if (typeof audience !== 'string' || !audience.trim() || audience !== audience.trim()) {
     throw new Error('VERIFY_PROTOCOL_AUDIENCE must be a non-empty string.');
   }
 
-  if (
-    typeof syncPath !== 'string'
-    || !syncPath.startsWith('/')
-    || syncPath.includes('?')
-    || syncPath !== syncPath.trim()
-  ) {
-    throw new Error('VERIFY_SYNC_PATH must be an absolute HTTP path without a query string.');
-  }
-  if (
-    typeof healthPath !== 'string'
-    || !healthPath.startsWith('/')
-    || healthPath.includes('?')
-    || healthPath !== healthPath.trim()
-  ) {
-    throw new Error('VERIFY_HEALTH_PATH must be an absolute HTTP path without a query string.');
-  }
   if (healthPath === syncPath) {
     throw new Error('VERIFY_HEALTH_PATH must differ from VERIFY_SYNC_PATH.');
+  }
+  if (syncPath === DEFAULT_LIVENESS_PATH || healthPath === DEFAULT_LIVENESS_PATH) {
+    throw new Error('Internal protocol paths must differ from the liveness path.');
   }
 
   return Object.freeze({
@@ -151,7 +154,28 @@ function loadProtocolConfig(env = process.env) {
   });
 }
 
+function loadPublicVerificationConfig(env = process.env, protocolConfig = loadProtocolConfig(env)) {
+  const checkPath = parseAbsolutePath(env.VERIFY_CHECK_PATH, DEFAULT_CHECK_PATH, 'VERIFY_CHECK_PATH');
+  if (checkPath === protocolConfig.syncPath || checkPath === protocolConfig.healthPath) {
+    throw new Error('VERIFY_CHECK_PATH must differ from internal protocol paths.');
+  }
+  if (checkPath === DEFAULT_LIVENESS_PATH) {
+    throw new Error('VERIFY_CHECK_PATH must differ from the liveness path.');
+  }
+
+  return Object.freeze({
+    checkPath,
+    maxSyncAgeMs: parsePositiveSafeInteger(
+      env.VERIFY_MAX_SYNC_AGE_MS,
+      DEFAULT_MAX_SYNC_AGE_MS,
+      'VERIFY_MAX_SYNC_AGE_MS',
+      { max: 24 * 60 * 60 * 1000 },
+    ),
+  });
+}
+
 function loadRuntimeConfig(env = process.env) {
+  const protocol = loadProtocolConfig(env);
   return Object.freeze({
     http: Object.freeze({
       host: parseHost(env.HOST),
@@ -173,17 +197,21 @@ function loadRuntimeConfig(env = process.env) {
       ),
       uri: parseMongoUri(env.MONGODB_URI),
     }),
-    protocol: loadProtocolConfig(env),
+    protocol,
+    publicVerification: loadPublicVerificationConfig(env, protocol),
     publicKeys: loadPublicKeyRing(env.VERIFY_PUBLIC_KEYS),
   });
 }
 
 module.exports = {
   DATABASE_NAME_PATTERN,
+  DEFAULT_CHECK_PATH,
   DEFAULT_HTTP_HOST,
   DEFAULT_HEALTH_PATH,
   DEFAULT_HTTP_PORT,
+  DEFAULT_LIVENESS_PATH,
   DEFAULT_MAX_CLOCK_SKEW_MS,
+  DEFAULT_MAX_SYNC_AGE_MS,
   DEFAULT_MONGODB_DATABASE,
   DEFAULT_MONGO_SERVER_SELECTION_TIMEOUT_MS,
   DEFAULT_PROTOCOL_AUDIENCE,
@@ -193,8 +221,10 @@ module.exports = {
   MAX_PUBLIC_KEYS,
   MAX_PUBLIC_KEY_RING_BYTES,
   loadProtocolConfig,
+  loadPublicVerificationConfig,
   loadPublicKeyRing,
   loadRuntimeConfig,
+  parseAbsolutePath,
   parseDatabaseName,
   parseHost,
   parseMongoUri,

@@ -11,6 +11,7 @@ async function withApp(run, overrides = {}) {
     collection: { findOne: async () => null },
     healthCollection: { findOne: async () => null },
     protocolConfig: { audience: AUDIENCE, healthPath: SIGNED_HEALTH_PATH, maxClockSkewMs: 300_000, syncPath: PATH },
+    publicConfig: { checkPath: '/check', maxSyncAgeMs: 300_000 },
     publicKeys: { [KEY_ID]: publicKey },
     ...overrides,
   });

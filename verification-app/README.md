@@ -7,8 +7,8 @@ record schema, deterministic materialization from verified signed bytes, stored-
 integrity re-verification, and an atomic compare-and-swap persistence service. Phase 2A.3a
 added the fail-closed HTTP boundary for `POST /internal/sync`, and Phase 2A.3b added the
 MongoDB-backed executable lifecycle. Phase 2A.4a adds a separately domain-separated, signed
-source-health heartbeat used later to prevent stale ACTIVE records from displaying as VALID.
-The existing local backend/frontend remain unchanged.
+source-health heartbeat, and Phase 2A.4b adds the public `GET /check?token=...` decision
+boundary. The existing local backend/frontend remain unchanged.
 
 ## Record-sync envelope (protocol v1)
 
@@ -55,7 +55,7 @@ compare-and-swap boundary:
 4. a revoked token is terminal and cannot become active or expired again;
 5. duplicate-key insert races and concurrent update races are retried without blind overwrite.
 
-Every public read will later call `assertStoredRecordIntegrity()`, which re-verifies the old
+Every public read calls `assertStoredRecordIntegrity()`, which re-verifies the old
 Ed25519 signature without applying the short incoming-request replay window, re-parses the
 canonical envelope, and compares all materialized fields with signed truth.
 
@@ -77,8 +77,8 @@ responses use `no-store` and restrictive security headers. Unexpected persistenc
 return a generic `503` without reflecting database errors, credentials, signed bytes, or
 record contents.
 
-The handler is dependency-injected with a Mongo-compatible collection. The next isolated
-slice will add the official MongoDB driver, index-before-listen startup, and graceful shutdown.
+The handler is dependency-injected with a Mongo-compatible collection; MongoDB startup,
+index-before-listen, and graceful shutdown are provided by the service lifecycle below.
 
 ## Security invariants
 
@@ -127,6 +127,8 @@ directly; it does not load `.env` files automatically.
 - `VERIFY_MONGO_SERVER_SELECTION_TIMEOUT_MS` — startup database selection timeout.
 - `VERIFY_SHUTDOWN_GRACE_MS` — bounded HTTP shutdown grace period.
 - Existing protocol variables control audience, record-sync path, signed-health path, and replay window.
+- `VERIFY_CHECK_PATH` — public verification endpoint, default `/check`.
+- `VERIFY_MAX_SYNC_AGE_MS` — maximum age of a drained-queue heartbeat before ACTIVE becomes UNKNOWN; default 300000 ms.
 
 The office Ed25519 private key must never be copied into this cloud application. Start the
 receiver after setting real environment values:
@@ -137,8 +139,8 @@ npm start
 ```
 
 `GET /healthz` and `HEAD /healthz` provide a minimal no-store liveness response. The listener
-exists only after the startup database/index gate has completed; this endpoint is not the
-signed office-source freshness heartbeat planned for the public verification decision logic.
+exists only after the startup database/index gate has completed; this endpoint is separate from the
+signed office-source freshness heartbeat used by the public verification decision logic.
 
 ## Signed source-health heartbeat
 
@@ -157,6 +159,23 @@ applies heartbeats atomically:
 4. stale epoch/timestamp and conflicting equal heartbeat state return `409`;
 5. database-only mutation of materialized health fields fails closed.
 
-This heartbeat does not yet make any public credential VALID. The next slice will add
-`GET /check?token=...`, re-verify both the signed record and signed source-health state on read,
-apply read-time expiry, and return `UNKNOWN` whenever ACTIVE state lacks fresh source health.
+## Public verification endpoint
+
+`GET /check?token=<uuid>` hashes the normalized UUID locally and performs an indexed lookup;
+the raw token is never stored or reflected in responses. Before returning credential details,
+the service re-verifies the exact stored Ed25519 record evidence and, when present, the signed
+source-health singleton. Database-only mutation therefore fails closed instead of producing a
+valid-looking response.
+
+Results are evaluated in this order:
+
+1. signed `REVOKED`, signed `EXPIRED`, or read-time expiry returns `NOT_VALID`;
+2. signed `ACTIVE` with a fresh same-epoch heartbeat returns `VALID`;
+3. signed `ACTIVE` with missing, stale, or different-epoch health returns `UNKNOWN` with
+   `valid: null`.
+
+The response exposes only the minimized signed projection, scoped issuance receipt, sync and
+health timestamps, and verification time. It never exposes raw tokens, canonical hashes, full
+identity data, or revocation reasons. Public responses use `no-store, private`, no-referrer,
+noindex/nofollow, and restrictive content headers. Layered per-IP, per-token, and service-wide
+rate limiting remains a separate security-hardening gate before public deployment.

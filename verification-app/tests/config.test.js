@@ -3,11 +3,15 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
+  DEFAULT_CHECK_PATH,
   DEFAULT_HEALTH_PATH,
+  DEFAULT_LIVENESS_PATH,
   DEFAULT_MAX_CLOCK_SKEW_MS,
+  DEFAULT_MAX_SYNC_AGE_MS,
   DEFAULT_PROTOCOL_AUDIENCE,
   DEFAULT_SYNC_PATH,
   loadProtocolConfig,
+  loadPublicVerificationConfig,
 } = require('../src/config');
 
 test('loads safe protocol defaults without environment secrets', () => {
@@ -33,12 +37,61 @@ test('accepts explicit audience, path, and replay window configuration', () => {
   });
 });
 
+
+test('loads public verification defaults and explicit freshness settings', () => {
+  assert.deepEqual(loadPublicVerificationConfig({}), {
+    checkPath: DEFAULT_CHECK_PATH,
+    maxSyncAgeMs: DEFAULT_MAX_SYNC_AGE_MS,
+  });
+
+  const protocol = loadProtocolConfig({
+    VERIFY_HEALTH_PATH: '/v1/internal/health',
+    VERIFY_SYNC_PATH: '/v1/internal/sync',
+  });
+  assert.deepEqual(loadPublicVerificationConfig({
+    VERIFY_CHECK_PATH: '/v1/check',
+    VERIFY_MAX_SYNC_AGE_MS: '120000',
+  }, protocol), {
+    checkPath: '/v1/check',
+    maxSyncAgeMs: 120000,
+  });
+});
+
+test('rejects unsafe public verification configuration', () => {
+  assert.throws(
+    () => loadPublicVerificationConfig({ VERIFY_CHECK_PATH: 'check' }),
+    /absolute HTTP path/,
+  );
+  assert.throws(
+    () => loadPublicVerificationConfig({ VERIFY_CHECK_PATH: '/check?debug=1' }),
+    /without a query string/,
+  );
+  assert.throws(
+    () => loadPublicVerificationConfig({ VERIFY_CHECK_PATH: '/internal/sync' }),
+    /must differ from internal protocol paths/,
+  );
+  assert.throws(
+    () => loadPublicVerificationConfig({ VERIFY_CHECK_PATH: DEFAULT_LIVENESS_PATH }),
+    /must differ from the liveness path/,
+  );
+  assert.throws(
+    () => loadPublicVerificationConfig({ VERIFY_MAX_SYNC_AGE_MS: '0' }),
+    /positive safe integer/,
+  );
+  assert.throws(
+    () => loadPublicVerificationConfig({ VERIFY_MAX_SYNC_AGE_MS: '86400001' }),
+    /positive safe integer/,
+  );
+});
+
 test('rejects malformed protocol configuration', () => {
   assert.throws(() => loadProtocolConfig({ VERIFY_SYNC_PATH: 'internal/sync' }), /absolute HTTP path/);
   assert.throws(() => loadProtocolConfig({ VERIFY_SYNC_PATH: '/internal/sync?debug=1' }), /without a query string/);
   assert.throws(() => loadProtocolConfig({ VERIFY_HEALTH_PATH: 'internal/health' }), /absolute HTTP path/);
   assert.throws(() => loadProtocolConfig({ VERIFY_HEALTH_PATH: '/internal/health?debug=1' }), /without a query string/);
   assert.throws(() => loadProtocolConfig({ VERIFY_HEALTH_PATH: '/same', VERIFY_SYNC_PATH: '/same' }), /must differ/);
+  assert.throws(() => loadProtocolConfig({ VERIFY_SYNC_PATH: DEFAULT_LIVENESS_PATH }), /liveness path/);
+  assert.throws(() => loadProtocolConfig({ VERIFY_HEALTH_PATH: DEFAULT_LIVENESS_PATH }), /liveness path/);
   assert.throws(() => loadProtocolConfig({ VERIFY_PROTOCOL_AUDIENCE: ' audience ' }), /non-empty string/);
   assert.throws(() => loadProtocolConfig({ VERIFY_MAX_REQUEST_AGE_MS: '0' }), /positive safe integer/);
   assert.throws(() => loadProtocolConfig({ VERIFY_MAX_REQUEST_AGE_MS: '1.5' }), /positive safe integer/);
@@ -73,6 +126,10 @@ test('loads fail-closed runtime configuration and validates Ed25519 public keys 
   assert.equal(config.mongo.databaseName, DEFAULT_MONGODB_DATABASE);
   assert.equal(config.mongo.serverSelectionTimeoutMs, DEFAULT_MONGO_SERVER_SELECTION_TIMEOUT_MS);
   assert.equal(config.mongo.uri, 'mongodb://127.0.0.1:27017');
+  assert.deepEqual(config.publicVerification, {
+    checkPath: DEFAULT_CHECK_PATH,
+    maxSyncAgeMs: DEFAULT_MAX_SYNC_AGE_MS,
+  });
   assert.equal(config.publicKeys['office-key-1'].asymmetricKeyType, 'ed25519');
   assert.equal(Object.isFrozen(config), true);
   assert.equal(Object.isFrozen(config.publicKeys), true);
@@ -83,6 +140,8 @@ test('accepts explicit cloud listener and MongoDB lifecycle settings', () => {
     HOST: '127.0.0.1',
     PORT: '0',
     MONGODB_URI: 'mongodb+srv://cluster.example/verification',
+    VERIFY_CHECK_PATH: '/v1/check',
+    VERIFY_MAX_SYNC_AGE_MS: '180000',
     VERIFY_MONGODB_DATABASE: 'verification_staging',
     VERIFY_MONGO_SERVER_SELECTION_TIMEOUT_MS: '4500',
     VERIFY_PUBLIC_KEYS: JSON.stringify({ key_2026: publicKeyPem() }),
@@ -94,6 +153,7 @@ test('accepts explicit cloud listener and MongoDB lifecycle settings', () => {
     port: 0,
     shutdownGraceMs: 2500,
   });
+  assert.deepEqual(config.publicVerification, { checkPath: '/v1/check', maxSyncAgeMs: 180000 });
   assert.deepEqual(config.mongo, {
     databaseName: 'verification_staging',
     serverSelectionTimeoutMs: 4500,
