@@ -3,6 +3,7 @@
 const { createPublicKey, verify } = require('node:crypto');
 const {
   EnvelopeValidationError,
+  parseCanonicalHealthEnvelope,
   parseCanonicalRecordEnvelope,
 } = require('./canonicalEnvelope');
 
@@ -83,24 +84,34 @@ function parseHeaderTimestamp(value) {
   return parsed;
 }
 
-function parseSignedEnvelope(signedPayload) {
+function parseEnvelopeWith(parser, signedPayload) {
   try {
-    return parseCanonicalRecordEnvelope(signedPayload);
+    return parser(signedPayload);
   } catch (error) {
     if (error instanceof EnvelopeValidationError) throw error;
     throw new SignatureVerificationError('Signed envelope could not be parsed.', 'INVALID_SIGNED_ENVELOPE', 400);
   }
 }
 
-function verifyStoredRecordSignature({
+function parseSignedEnvelope(signedPayload) {
+  return parseEnvelopeWith(parseCanonicalRecordEnvelope, signedPayload);
+}
+
+function parseSignedHealthEnvelope(signedPayload) {
+  return parseEnvelopeWith(parseCanonicalHealthEnvelope, signedPayload);
+}
+
+function verifyStoredEnvelopeSignature({
   audience,
   method = 'POST',
+  parseEnvelope,
   path,
   publicKeys,
   signatureBase64,
   signedPayload,
 }) {
-  const envelope = parseSignedEnvelope(signedPayload);
+  if (typeof parseEnvelope !== 'function') throw new TypeError('parseEnvelope must be a function.');
+  const envelope = parseEnvelope(signedPayload);
 
   if (method !== envelope.method) {
     throw new SignatureVerificationError('HTTP method does not match the signed envelope.', 'METHOD_MISMATCH', 400);
@@ -124,6 +135,62 @@ function verifyStoredRecordSignature({
     signature: signatureBase64,
     signedPayload,
   });
+}
+
+function verifyStoredRecordSignature(options) {
+  return verifyStoredEnvelopeSignature({
+    ...options,
+    parseEnvelope: parseSignedEnvelope,
+  });
+}
+
+function verifyStoredHealthSignature(options) {
+  return verifyStoredEnvelopeSignature({
+    ...options,
+    parseEnvelope: parseSignedHealthEnvelope,
+  });
+}
+
+function verifyHealthSyncRequest({
+  audience,
+  headerKeyId,
+  headerTimestamp,
+  maxClockSkewMs,
+  method,
+  now = Date.now(),
+  path,
+  publicKeys,
+  signatureBase64,
+  signedPayload,
+}) {
+  const verified = verifyStoredHealthSignature({
+    audience,
+    method,
+    path,
+    publicKeys,
+    signatureBase64,
+    signedPayload,
+  });
+  const { envelope } = verified;
+
+  if (headerKeyId !== envelope.keyId) {
+    throw new SignatureVerificationError('X-Key-Id does not match the signed envelope.', 'KEY_ID_MISMATCH', 400);
+  }
+
+  const parsedHeaderTimestamp = parseHeaderTimestamp(headerTimestamp);
+  if (parsedHeaderTimestamp !== envelope.timestamp) {
+    throw new SignatureVerificationError('X-Timestamp does not match the signed envelope.', 'TIMESTAMP_MISMATCH', 400);
+  }
+
+  if (!Number.isSafeInteger(now) || !Number.isSafeInteger(maxClockSkewMs) || maxClockSkewMs <= 0) {
+    throw new TypeError('now and maxClockSkewMs must be valid safe integers.');
+  }
+
+  if (Math.abs(now - envelope.timestamp) > maxClockSkewMs) {
+    throw new SignatureVerificationError('Signed request timestamp is outside the accepted window.', 'STALE_SIGNED_REQUEST');
+  }
+
+  return verified;
 }
 
 function verifyRecordSyncRequest({
@@ -175,6 +242,10 @@ module.exports = {
   getEd25519PublicKey,
   parseHeaderTimestamp,
   parseSignedEnvelope,
+  parseSignedHealthEnvelope,
+  verifyHealthSyncRequest,
   verifyRecordSyncRequest,
+  verifyStoredEnvelopeSignature,
+  verifyStoredHealthSignature,
   verifyStoredRecordSignature,
 };

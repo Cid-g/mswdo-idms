@@ -147,3 +147,59 @@ test('parser rejects duplicate-key JSON because it cannot equal canonical bytes'
     (error) => error.code === 'NON_CANONICAL_SIGNED_ENVELOPE',
   );
 });
+
+test('buildHealthEnvelope produces a domain-separated canonical heartbeat', () => {
+  const {
+    HEALTH_SIGNATURE_DOMAIN,
+    buildHealthEnvelope,
+    parseCanonicalHealthEnvelope,
+  } = require('../src/crypto/canonicalEnvelope');
+  const timestamp = 1785940200123;
+  const signedPayload = buildHealthEnvelope({
+    audience: 'mswdo-verification-service',
+    epoch: 4,
+    keyId: 'office-key-2026-01',
+    path: '/internal/health',
+    payload: { sourceLastHealthyAt: timestamp },
+    timestamp,
+  });
+  const parsed = parseCanonicalHealthEnvelope(signedPayload);
+  assert.equal(parsed.domain, HEALTH_SIGNATURE_DOMAIN);
+  assert.equal(parsed.epoch, 4);
+  assert.equal(parsed.payload.sourceLastHealthyAt, timestamp);
+  assert.equal(Object.isFrozen(parsed.payload), true);
+});
+
+test('health envelope rejects timestamp mismatch, extra fields, and record-domain bytes', () => {
+  const {
+    buildHealthEnvelope,
+    parseCanonicalHealthEnvelope,
+  } = require('../src/crypto/canonicalEnvelope');
+  const timestamp = 1785940200123;
+  assert.throws(
+    () => buildHealthEnvelope({
+      audience: 'mswdo-verification-service',
+      epoch: 1,
+      keyId: 'office-key-2026-01',
+      path: '/internal/health',
+      payload: { sourceLastHealthyAt: timestamp - 1 },
+      timestamp,
+    }),
+    (error) => error.code === 'HEALTH_TIMESTAMP_MISMATCH',
+  );
+  assert.throws(
+    () => buildHealthEnvelope({
+      audience: 'mswdo-verification-service',
+      epoch: 1,
+      keyId: 'office-key-2026-01',
+      path: '/internal/health',
+      payload: { sourceLastHealthyAt: timestamp, queueDepth: 0 },
+      timestamp,
+    }),
+    /fields do not match/,
+  );
+  assert.throws(
+    () => parseCanonicalHealthEnvelope(buildRecordEnvelope(envelopeInput())),
+    /health-sync protocol schema/,
+  );
+});

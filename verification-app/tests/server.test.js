@@ -69,6 +69,7 @@ test('does not create or listen on HTTP until the store is ready', async () => {
   const fakeServer = new FakeServer(events);
   const store = {
     collection: { findOne: async () => null },
+    healthCollection: { findOne: async () => null },
     async close() { events.push('store:close'); },
   };
 
@@ -101,6 +102,7 @@ test('closes an initialized store when listener construction fails', async () =>
     startVerificationServer({
       connectStore: async () => ({
         collection: { findOne: async () => null },
+        healthCollection: { findOne: async () => null },
         async close() { closeCalls += 1; },
       }),
       createServer: () => { throw startupFailure; },
@@ -118,6 +120,7 @@ test('serves health only after startup and shuts down the real listener cleanly'
   const runtime = await startVerificationServer({
     connectStore: async () => ({
       collection: { findOne: async () => null },
+      healthCollection: { findOne: async () => null },
       async close() { closeCalls += 1; },
     }),
     env: runtimeEnv(),
@@ -163,6 +166,7 @@ test('contains unexpected async request failures behind a generic 503', async ()
   const runtime = await startVerificationServer({
     connectStore: async () => ({
       collection: { findOne: async () => null },
+      healthCollection: { findOne: async () => null },
       async close() {},
     }),
     createRequestHandler: () => async () => {

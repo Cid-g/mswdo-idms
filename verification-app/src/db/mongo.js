@@ -1,5 +1,6 @@
 'use strict';
 
+const { SOURCE_HEALTH_COLLECTION } = require('../models/sourceHealth');
 const { VERIFIED_RECORD_COLLECTION } = require('../models/verifiedRecord');
 const { ensureVerifiedRecordIndexes } = require('../services/verifiedRecordStore');
 
@@ -48,6 +49,7 @@ async function connectVerificationStore(config, {
     const database = client.db(config.databaseName);
     await database.command({ ping: 1 });
     const collection = database.collection(VERIFIED_RECORD_COLLECTION);
+    const healthCollection = database.collection(SOURCE_HEALTH_COLLECTION);
     const indexNames = await ensureIndexes(collection);
 
     return Object.freeze({
@@ -55,6 +57,7 @@ async function connectVerificationStore(config, {
       close,
       collection,
       database,
+      healthCollection,
       indexNames,
     });
   } catch (error) {

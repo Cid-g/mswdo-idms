@@ -1,11 +1,12 @@
 'use strict';
 
 const { generateKeyPairSync, sign } = require('node:crypto');
-const { buildRecordEnvelope } = require('../src/crypto/canonicalEnvelope');
-const { verifyStoredRecordSignature } = require('../src/crypto/signatureVerifier');
+const { buildHealthEnvelope, buildRecordEnvelope } = require('../src/crypto/canonicalEnvelope');
+const { verifyStoredHealthSignature, verifyStoredRecordSignature } = require('../src/crypto/signatureVerifier');
 
 const AUDIENCE = 'mswdo-verification-service';
 const PATH = '/internal/sync';
+const HEALTH_PATH = '/internal/health';
 const KEY_ID = 'office-key-2026-01';
 const TOKEN_HASH = 'c'.repeat(64);
 const TIMESTAMP = 1785940200123;
@@ -27,6 +28,36 @@ function validRecordPayload(overrides = {}) {
     status: 'ACTIVE',
     txId: TX_ID,
     ...overrides,
+  };
+}
+
+function signedHealth({
+  epoch = 1,
+  keyId = KEY_ID,
+  timestamp = TIMESTAMP,
+  signingKey = privateKey,
+} = {}) {
+  const signedPayload = buildHealthEnvelope({
+    audience: AUDIENCE,
+    epoch,
+    keyId,
+    path: HEALTH_PATH,
+    payload: { sourceLastHealthyAt: timestamp },
+    timestamp,
+  });
+  const signatureBase64 = sign(null, Buffer.from(signedPayload, 'utf8'), signingKey).toString('base64');
+  const verifiedRequest = verifyStoredHealthSignature({
+    audience: AUDIENCE,
+    path: HEALTH_PATH,
+    publicKeys: { [keyId]: publicKey },
+    signatureBase64,
+    signedPayload,
+  });
+
+  return {
+    signatureBase64,
+    signedPayload,
+    verifiedRequest,
   };
 }
 
@@ -68,6 +99,7 @@ function signedRecord({
 module.exports = {
   ANCHORED_HASH,
   AUDIENCE,
+  HEALTH_PATH,
   KEY_ID,
   PATH,
   TIMESTAMP,
@@ -75,6 +107,7 @@ module.exports = {
   TX_ID,
   privateKey,
   publicKey,
+  signedHealth,
   signedRecord,
   validRecordPayload,
 };

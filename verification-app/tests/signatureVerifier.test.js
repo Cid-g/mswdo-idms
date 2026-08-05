@@ -3,9 +3,11 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { generateKeyPairSync, sign } = require('node:crypto');
-const { buildRecordEnvelope } = require('../src/crypto/canonicalEnvelope');
+const { buildHealthEnvelope, buildRecordEnvelope } = require('../src/crypto/canonicalEnvelope');
 const {
   SignatureVerificationError,
+  verifyHealthSyncRequest,
+  verifyStoredHealthSignature,
   verifyRecordSyncRequest,
   verifyStoredRecordSignature,
 } = require('../src/crypto/signatureVerifier');
@@ -197,4 +199,40 @@ test('exposes stable error metadata for endpoint mapping', () => {
   assert.equal(error.name, 'SignatureVerificationError');
   assert.equal(error.code, 'EXAMPLE');
   assert.equal(error.status, 409);
+});
+
+test('verifies signed health requests with separate path and domain', () => {
+  const signedPayload = buildHealthEnvelope({
+    audience: 'mswdo-verification-service',
+    epoch: 1,
+    keyId: 'office-key-2026-01',
+    path: '/internal/health',
+    payload: { sourceLastHealthyAt: NOW },
+    timestamp: NOW,
+  });
+  const signatureBase64 = sign(null, Buffer.from(signedPayload, 'utf8'), privateKey).toString('base64');
+  const options = {
+    audience: 'mswdo-verification-service',
+    headerKeyId: 'office-key-2026-01',
+    headerTimestamp: String(NOW),
+    maxClockSkewMs: MAX_CLOCK_SKEW_MS,
+    method: 'POST',
+    now: NOW,
+    path: '/internal/health',
+    publicKeys: { 'office-key-2026-01': publicKey },
+    signatureBase64,
+    signedPayload,
+  };
+  assert.equal(verifyHealthSyncRequest(options).envelope.payload.sourceLastHealthyAt, NOW);
+  assert.doesNotThrow(() => verifyStoredHealthSignature({
+    audience: options.audience,
+    path: options.path,
+    publicKeys: options.publicKeys,
+    signatureBase64,
+    signedPayload,
+  }));
+  assert.throws(
+    () => verifyHealthSyncRequest({ ...options, path: '/internal/sync' }),
+    (error) => error.code === 'PATH_MISMATCH',
+  );
 });

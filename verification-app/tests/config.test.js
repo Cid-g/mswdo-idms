@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
+  DEFAULT_HEALTH_PATH,
   DEFAULT_MAX_CLOCK_SKEW_MS,
   DEFAULT_PROTOCOL_AUDIENCE,
   DEFAULT_SYNC_PATH,
@@ -12,6 +13,7 @@ const {
 test('loads safe protocol defaults without environment secrets', () => {
   assert.deepEqual(loadProtocolConfig({}), {
     audience: DEFAULT_PROTOCOL_AUDIENCE,
+    healthPath: DEFAULT_HEALTH_PATH,
     syncPath: DEFAULT_SYNC_PATH,
     maxClockSkewMs: DEFAULT_MAX_CLOCK_SKEW_MS,
   });
@@ -20,10 +22,12 @@ test('loads safe protocol defaults without environment secrets', () => {
 test('accepts explicit audience, path, and replay window configuration', () => {
   assert.deepEqual(loadProtocolConfig({
     VERIFY_PROTOCOL_AUDIENCE: 'verify.staging.example',
+    VERIFY_HEALTH_PATH: '/v1/internal/health',
     VERIFY_SYNC_PATH: '/v1/internal/sync',
     VERIFY_MAX_REQUEST_AGE_MS: '120000',
   }), {
     audience: 'verify.staging.example',
+    healthPath: '/v1/internal/health',
     syncPath: '/v1/internal/sync',
     maxClockSkewMs: 120000,
   });
@@ -32,6 +36,9 @@ test('accepts explicit audience, path, and replay window configuration', () => {
 test('rejects malformed protocol configuration', () => {
   assert.throws(() => loadProtocolConfig({ VERIFY_SYNC_PATH: 'internal/sync' }), /absolute HTTP path/);
   assert.throws(() => loadProtocolConfig({ VERIFY_SYNC_PATH: '/internal/sync?debug=1' }), /without a query string/);
+  assert.throws(() => loadProtocolConfig({ VERIFY_HEALTH_PATH: 'internal/health' }), /absolute HTTP path/);
+  assert.throws(() => loadProtocolConfig({ VERIFY_HEALTH_PATH: '/internal/health?debug=1' }), /without a query string/);
+  assert.throws(() => loadProtocolConfig({ VERIFY_HEALTH_PATH: '/same', VERIFY_SYNC_PATH: '/same' }), /must differ/);
   assert.throws(() => loadProtocolConfig({ VERIFY_PROTOCOL_AUDIENCE: ' audience ' }), /non-empty string/);
   assert.throws(() => loadProtocolConfig({ VERIFY_MAX_REQUEST_AGE_MS: '0' }), /positive safe integer/);
   assert.throws(() => loadProtocolConfig({ VERIFY_MAX_REQUEST_AGE_MS: '1.5' }), /positive safe integer/);

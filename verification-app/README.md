@@ -5,8 +5,10 @@ This directory contains the independently hosted public-verification service.
 Phase 2A.1 established the signed record-sync protocol. Phase 2A.2 added the exact minimized
 record schema, deterministic materialization from verified signed bytes, stored-record
 integrity re-verification, and an atomic compare-and-swap persistence service. Phase 2A.3a
-adds the fail-closed HTTP boundary for `POST /internal/sync`. It still does not connect to a
-real MongoDB deployment, start a production listener, or change the existing local backend/frontend.
+added the fail-closed HTTP boundary for `POST /internal/sync`, and Phase 2A.3b added the
+MongoDB-backed executable lifecycle. Phase 2A.4a adds a separately domain-separated, signed
+source-health heartbeat used later to prevent stale ACTIVE records from displaying as VALID.
+The existing local backend/frontend remain unchanged.
 
 ## Record-sync envelope (protocol v1)
 
@@ -124,7 +126,7 @@ directly; it does not load `.env` files automatically.
 - `HOST` / `PORT` — defaults to `0.0.0.0:3002`; hosting platforms normally provide `PORT`.
 - `VERIFY_MONGO_SERVER_SELECTION_TIMEOUT_MS` — startup database selection timeout.
 - `VERIFY_SHUTDOWN_GRACE_MS` — bounded HTTP shutdown grace period.
-- Existing protocol variables continue to control audience, sync path, and replay window.
+- Existing protocol variables control audience, record-sync path, signed-health path, and replay window.
 
 The office Ed25519 private key must never be copied into this cloud application. Start the
 receiver after setting real environment values:
@@ -137,3 +139,24 @@ npm start
 `GET /healthz` and `HEAD /healthz` provide a minimal no-store liveness response. The listener
 exists only after the startup database/index gate has completed; this endpoint is not the
 signed office-source freshness heartbeat planned for the public verification decision logic.
+
+## Signed source-health heartbeat
+
+`POST /internal/health` accepts a separate canonical Ed25519-signed envelope with domain
+`MSWDO-IDMS/VERIFY-HEALTH/V1`. Its only payload field is `sourceLastHealthyAt`, and that value
+must exactly equal the signed request timestamp. The office will send this heartbeat only after
+its verification outbox is drained; the cloud cannot infer that condition independently.
+
+The service stores one singleton document in the `source_health` collection. It preserves the
+exact signed bytes and signature, re-verifies stored state before every ordering decision, and
+applies heartbeats atomically:
+
+1. a higher signed epoch supersedes an older restore generation;
+2. within an epoch, only a later signed heartbeat replaces state;
+3. exact replay is idempotent;
+4. stale epoch/timestamp and conflicting equal heartbeat state return `409`;
+5. database-only mutation of materialized health fields fails closed.
+
+This heartbeat does not yet make any public credential VALID. The next slice will add
+`GET /check?token=...`, re-verify both the signed record and signed source-health state on read,
+apply read-time expiry, and return `UNKNOWN` whenever ACTIVE state lacks fresh source health.

@@ -4,6 +4,7 @@ const { getEd25519PublicKey } = require('./crypto/signatureVerifier');
 
 const DEFAULT_PROTOCOL_AUDIENCE = 'mswdo-verification-service';
 const DEFAULT_SYNC_PATH = '/internal/sync';
+const DEFAULT_HEALTH_PATH = '/internal/health';
 const DEFAULT_MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
 const DEFAULT_HTTP_HOST = '0.0.0.0';
 const DEFAULT_HTTP_PORT = 3002;
@@ -112,6 +113,7 @@ function loadPublicKeyRing(value) {
 function loadProtocolConfig(env = process.env) {
   const audience = env.VERIFY_PROTOCOL_AUDIENCE || DEFAULT_PROTOCOL_AUDIENCE;
   const syncPath = env.VERIFY_SYNC_PATH || DEFAULT_SYNC_PATH;
+  const healthPath = env.VERIFY_HEALTH_PATH || DEFAULT_HEALTH_PATH;
 
   if (typeof audience !== 'string' || !audience.trim() || audience !== audience.trim()) {
     throw new Error('VERIFY_PROTOCOL_AUDIENCE must be a non-empty string.');
@@ -125,9 +127,21 @@ function loadProtocolConfig(env = process.env) {
   ) {
     throw new Error('VERIFY_SYNC_PATH must be an absolute HTTP path without a query string.');
   }
+  if (
+    typeof healthPath !== 'string'
+    || !healthPath.startsWith('/')
+    || healthPath.includes('?')
+    || healthPath !== healthPath.trim()
+  ) {
+    throw new Error('VERIFY_HEALTH_PATH must be an absolute HTTP path without a query string.');
+  }
+  if (healthPath === syncPath) {
+    throw new Error('VERIFY_HEALTH_PATH must differ from VERIFY_SYNC_PATH.');
+  }
 
   return Object.freeze({
     audience,
+    healthPath,
     syncPath,
     maxClockSkewMs: parsePositiveSafeInteger(
       env.VERIFY_MAX_REQUEST_AGE_MS,
@@ -167,6 +181,7 @@ function loadRuntimeConfig(env = process.env) {
 module.exports = {
   DATABASE_NAME_PATTERN,
   DEFAULT_HTTP_HOST,
+  DEFAULT_HEALTH_PATH,
   DEFAULT_HTTP_PORT,
   DEFAULT_MAX_CLOCK_SKEW_MS,
   DEFAULT_MONGODB_DATABASE,

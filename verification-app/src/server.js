@@ -177,6 +177,7 @@ async function startVerificationServer({
     store = await connectStore(config.mongo);
     const handler = createRequestHandler({
       collection: store.collection,
+      healthCollection: store.healthCollection,
       now,
       onError: (error) => logOperationalError(logger, 'sync request', error),
       protocolConfig: config.protocol,

@@ -1,11 +1,13 @@
 'use strict';
 
+const { createHealthRequestHandler } = require('./healthHandler');
 const { createSyncRequestHandler, writeJson } = require('./syncHandler');
 
 const HEALTH_PATH = '/healthz';
 
 function createVerificationRequestHandler(options) {
-  const syncHandler = createSyncRequestHandler(options);
+  const syncHandler = createSyncRequestHandler({ ...options, collection: options.collection });
+  const healthHandler = createHealthRequestHandler({ ...options, collection: options.healthCollection });
 
   return async function verificationRequestHandler(req, res) {
     let requestUrl;
@@ -39,6 +41,11 @@ function createVerificationRequestHandler(options) {
       }
 
       writeJson(res, 200, { status: 'ok' });
+      return;
+    }
+
+    if (requestUrl.pathname === options.protocolConfig.healthPath) {
+      await healthHandler(req, res);
       return;
     }
 
