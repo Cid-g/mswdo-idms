@@ -67,66 +67,83 @@ export default function IDCardPage() {
   const imageUrlRef     = useRef(null);
   const backImageUrlRef = useRef(null);
 
-  function setFrontImage(blob) {
+  const setFrontImage = useCallback((blob) => {
     if (imageUrlRef.current) URL.revokeObjectURL(imageUrlRef.current);
     const url = URL.createObjectURL(blob);
     imageUrlRef.current = url;
     setImageUrl(url);
-  }
+  }, []);
 
-  function setBackImage(blob) {
+  const setBackImage = useCallback((blob) => {
     if (backImageUrlRef.current) URL.revokeObjectURL(backImageUrlRef.current);
     const url = URL.createObjectURL(blob);
     backImageUrlRef.current = url;
     setBackImageUrl(url);
-  }
+  }, []);
 
   useEffect(() => () => {
     if (imageUrlRef.current)     URL.revokeObjectURL(imageUrlRef.current);
     if (backImageUrlRef.current) URL.revokeObjectURL(backImageUrlRef.current);
   }, []);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError('');
-    setActiveTab('front');
-    setBlockchainStatus(null);
-    setRevocationNotice('');
-    try {
-      const { data: a } = await api.get(`/applicants/${applicantId}`);
-      setApplicant(a);
+  useEffect(() => {
+    let active = true;
+
+    async function loadPage() {
+      // Defer state synchronization so the effect only initiates asynchronous work.
+      await Promise.resolve();
+      if (!active) return;
+
+      setLoading(true);
+      setError('');
+      setActiveTab('front');
+      setBlockchainStatus(null);
+      setRevocationNotice('');
 
       try {
-        const record = await getIDRecordByApplicant(applicantId);
-        setIDRecord(record);
-        const blob = await fetchIDImageBlob(record._id);
-        setFrontImage(blob);
-
-        if (record.idImageBackUrl) {
-          try {
-            const backBlob = await fetchIDBackImageBlob(record._id);
-            setBackImage(backBlob);
-          } catch { /* non-fatal — back might not be generated yet */ }
-        }
+        const { data: nextApplicant } = await api.get(`/applicants/${applicantId}`);
+        if (!active) return;
+        setApplicant(nextApplicant);
 
         try {
-          const bc = await getBlockchainStatus(record._id);
-          setBlockchainStatus(bc);
-        } catch { /* blockchain may be disabled */ }
-      } catch (e) {
-        if (e.response?.status !== 404) throw e;
-        setIDRecord(null);
-        setImageUrl(null);
-        setBackImageUrl(null);
-      }
-    } catch (e) {
-      setError(e.response?.data?.error?.message || 'Failed to load applicant data.');
-    } finally {
-      setLoading(false);
-    }
-  }, [applicantId]);
+          const record = await getIDRecordByApplicant(applicantId);
+          if (!active) return;
+          setIDRecord(record);
 
-  useEffect(() => { load(); }, [load]);
+          const blob = await fetchIDImageBlob(record._id);
+          if (!active) return;
+          setFrontImage(blob);
+
+          if (record.idImageBackUrl) {
+            try {
+              const backBlob = await fetchIDBackImageBlob(record._id);
+              if (active) setBackImage(backBlob);
+            } catch { /* non-fatal — back might not be generated yet */ }
+          }
+
+          try {
+            const blockchain = await getBlockchainStatus(record._id);
+            if (active) setBlockchainStatus(blockchain);
+          } catch { /* blockchain may be disabled */ }
+        } catch (loadError) {
+          if (loadError.response?.status !== 404) throw loadError;
+          if (!active) return;
+          setIDRecord(null);
+          setImageUrl(null);
+          setBackImageUrl(null);
+        }
+      } catch (loadError) {
+        if (active) {
+          setError(loadError.response?.data?.error?.message || 'Failed to load applicant data.');
+        }
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+
+    loadPage();
+    return () => { active = false; };
+  }, [applicantId, setBackImage, setFrontImage]);
 
   function showToast(type, msg) {
     setToast({ type, msg });

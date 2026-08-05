@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Plus, Pencil, KeyRound, UserCheck, UserX, Search, Users,
@@ -62,6 +62,12 @@ function formatDate(iso) {
   return new Date(iso).toLocaleDateString('en-PH', {
     year: 'numeric', month: 'short', day: 'numeric',
   });
+}
+
+function buildUsername(firstName, lastName) {
+  const first = firstName.toLowerCase().replace(/\s+/g, '');
+  const last = lastName.toLowerCase().replace(/\s+/g, '');
+  return first || last ? `${first}.${last}` : '';
 }
 
 // ─── Password strength ───────────────────────────────────────────────────────
@@ -144,14 +150,6 @@ function AddStaffModal({ theme, onClose, onCreated }) {
   const [errors,          setErrors]          = useState({});
   const [loading,         setLoading]         = useState(false);
 
-  // Auto-suggest username from first + last name
-  useEffect(() => {
-    if (usernameEdited) return;
-    const first = firstName.toLowerCase().replace(/\s+/g, '');
-    const last  = lastName.toLowerCase().replace(/\s+/g, '');
-    if (first || last) setUsername(`${first}.${last}`);
-  }, [firstName, lastName, usernameEdited]);
-
   const strength = getStrength(password);
 
   function clearErr(key) {
@@ -227,7 +225,12 @@ function AddStaffModal({ theme, onClose, onCreated }) {
               <input
                 type="text"
                 value={firstName}
-                onChange={(e) => { setFirstName(e.target.value); clearErr('firstName'); }}
+                onChange={(e) => {
+                  const nextFirstName = e.target.value;
+                  setFirstName(nextFirstName);
+                  if (!usernameEdited) setUsername(buildUsername(nextFirstName, lastName));
+                  clearErr('firstName');
+                }}
                 className={cn(inputCls, errors.firstName && 'border-danger')}
                 disabled={loading}
               />
@@ -236,7 +239,12 @@ function AddStaffModal({ theme, onClose, onCreated }) {
               <input
                 type="text"
                 value={lastName}
-                onChange={(e) => { setLastName(e.target.value); clearErr('lastName'); }}
+                onChange={(e) => {
+                  const nextLastName = e.target.value;
+                  setLastName(nextLastName);
+                  if (!usernameEdited) setUsername(buildUsername(firstName, nextLastName));
+                  clearErr('lastName');
+                }}
                 className={cn(inputCls, errors.lastName && 'border-danger')}
                 disabled={loading}
               />

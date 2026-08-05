@@ -24,18 +24,21 @@ export default function BarangayCombobox({
     : BARANGAYS;
 
   useEffect(() => {
-    if (open) {
-      const timer = setTimeout(() => searchRef.current?.focus(), 40);
-      return () => clearTimeout(timer);
-    } else {
-      setSearch('');
-    }
+    if (!open) return undefined;
+    const timer = setTimeout(() => searchRef.current?.focus(), 40);
+    return () => clearTimeout(timer);
   }, [open]);
+
+  function closeDropdown() {
+    setOpen(false);
+    setSearch('');
+  }
 
   useEffect(() => {
     function onOutside(e) {
       if (containerRef.current && !containerRef.current.contains(e.target)) {
         setOpen(false);
+        setSearch('');
       }
     }
     document.addEventListener('mousedown', onOutside);
@@ -43,7 +46,7 @@ export default function BarangayCombobox({
   }, []);
 
   function handleKeyDown(e) {
-    if (e.key === 'Escape') setOpen(false);
+    if (e.key === 'Escape') closeDropdown();
   }
 
   return (
@@ -51,7 +54,11 @@ export default function BarangayCombobox({
       {/* Trigger */}
       <button
         type="button"
-        onClick={() => { if (!disabled) setOpen((o) => !o); }}
+        onClick={() => {
+          if (disabled) return;
+          if (open) closeDropdown();
+          else setOpen(true);
+        }}
         disabled={disabled}
         className={cn(
           'w-full flex items-center justify-between border rounded-xl px-3.5 py-2.5 text-sm bg-white',
@@ -92,7 +99,7 @@ export default function BarangayCombobox({
                   onMouseDown={(e) => {
                     e.preventDefault();
                     onChange(b);
-                    setOpen(false);
+                    closeDropdown();
                   }}
                   className={cn(
                     'w-full flex items-center justify-between px-3.5 py-2 text-sm text-left',

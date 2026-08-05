@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Pencil, KeyRound, UserCheck, UserX, Users, Eye, EyeOff, ShieldAlert, UserPlus, Plus, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
@@ -26,12 +26,12 @@ const STATUS_LABEL = {
   SUSPENDED: 'Suspended',
 };
 
-function formatDate(iso) {
-  if (!iso) return '—';
-  return new Date(iso).toLocaleDateString('en-PH', {
-    year: 'numeric', month: 'short', day: 'numeric',
-  });
+function buildUsername(firstName, lastName) {
+  const first = firstName.toLowerCase().replace(/\s+/g, '');
+  const last = lastName.toLowerCase().replace(/\s+/g, '');
+  return first || last ? `${first}.${last}` : '';
 }
+
 
 // ─── Password strength ───────────────────────────────────────────────────────
 
@@ -112,13 +112,6 @@ function CreateAdminModal({ onClose, onCreated }) {
   const [showConfirm,     setShowConfirm]     = useState(false);
   const [errors,          setErrors]          = useState({});
   const [loading,         setLoading]         = useState(false);
-
-  useEffect(() => {
-    if (usernameEdited) return;
-    const first = firstName.toLowerCase().replace(/\s+/g, '');
-    const last  = lastName.toLowerCase().replace(/\s+/g, '');
-    if (first || last) setUsername(`${first}.${last}`);
-  }, [firstName, lastName, usernameEdited]);
 
   const strength = getStrength(password);
 
@@ -208,7 +201,12 @@ function CreateAdminModal({ onClose, onCreated }) {
               <input
                 type="text"
                 value={firstName}
-                onChange={(e) => { setFirstName(e.target.value); clearErr('firstName'); }}
+                onChange={(e) => {
+                  const nextFirstName = e.target.value;
+                  setFirstName(nextFirstName);
+                  if (!usernameEdited) setUsername(buildUsername(nextFirstName, lastName));
+                  clearErr('firstName');
+                }}
                 className={cn(inputCls, errors.firstName && 'border-danger')}
                 disabled={loading}
               />
@@ -217,7 +215,12 @@ function CreateAdminModal({ onClose, onCreated }) {
               <input
                 type="text"
                 value={lastName}
-                onChange={(e) => { setLastName(e.target.value); clearErr('lastName'); }}
+                onChange={(e) => {
+                  const nextLastName = e.target.value;
+                  setLastName(nextLastName);
+                  if (!usernameEdited) setUsername(buildUsername(firstName, nextLastName));
+                  clearErr('lastName');
+                }}
                 className={cn(inputCls, errors.lastName && 'border-danger')}
                 disabled={loading}
               />

@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import axios from 'axios';
 import {
-  ShieldCheck, ShieldAlert, ShieldX,
+  ShieldCheck, ShieldX,
   CheckCircle2, XCircle, Clock, Loader2,
   AlertCircle,
 } from 'lucide-react';
@@ -30,23 +30,26 @@ export default function VerificationPage() {
   const [params]  = useSearchParams();
   const token     = params.get('token');
   const [result,  setResult]  = useState(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(Boolean(token));
   const [error,   setError]   = useState('');
 
   useEffect(() => {
-    if (!token) {
-      setError('No verification token found in this URL.');
-      setLoading(false);
-      return;
-    }
+    if (!token) return undefined;
+
+    let active = true;
     axios.get(`/api/verify/${token}`)
-      .then((res) => setResult(res.data))
+      .then((res) => { if (active) setResult(res.data); })
       .catch((err) => {
+        if (!active) return;
         const msg = err.response?.data?.message || err.response?.data?.error?.message;
         setError(msg || 'This QR code could not be verified.');
       })
-      .finally(() => setLoading(false));
+      .finally(() => { if (active) setLoading(false); });
+
+    return () => { active = false; };
   }, [token]);
+
+  const displayError = token ? error : 'No verification token found in this URL.';
 
   return (
     <div className="min-h-screen flex flex-col" style={{ background: '#F7F8FA' }}>
@@ -70,8 +73,8 @@ export default function VerificationPage() {
           </p>
 
           {loading && <LoadingCard />}
-          {!loading && error && <ErrorCard message={error} />}
-          {!loading && !error && result && <ResultCard result={result} />}
+          {!loading && displayError && <ErrorCard message={displayError} />}
+          {!loading && !displayError && result && <ResultCard result={result} />}
         </div>
       </main>
 

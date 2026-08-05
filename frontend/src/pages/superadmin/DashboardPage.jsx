@@ -75,8 +75,8 @@ function KpiCard({ label, value, Icon, loading, warn, index }) {
 }
 
 // ── per-department detail card (light) ───────────────────────
-function DeptCard({ dept, c, loading, index }) {
-  const Metric = ({ label, value, warn }) => (
+function Metric({ label, value, warn, loading }) {
+  return (
     <div>
       <p className="text-xs mb-0.5" style={{ color: 'var(--color-muted)' }}>{label}</p>
       {loading
@@ -84,6 +84,9 @@ function DeptCard({ dept, c, loading, index }) {
         : <p className="font-serif text-xl leading-none" style={{ color: warn && value > 0 ? '#D97706' : 'var(--color-text-1)' }}>{(value ?? 0).toLocaleString()}</p>}
     </div>
   );
+}
+
+function DeptCard({ dept, c, loading, index }) {
   return (
     <div
       className="bg-white rounded-xl p-5 animate-fade-up"
@@ -96,9 +99,9 @@ function DeptCard({ dept, c, loading, index }) {
         <span className="text-sm font-semibold" style={{ color: 'var(--color-text-1)' }}>{dept.label}</span>
       </div>
       <div className="grid grid-cols-3 gap-2">
-        <Metric label="Applicants" value={c.applicants} />
-        <Metric label="Active IDs" value={c.activeIDs} />
-        <Metric label="Partial" value={c.partial} warn />
+        <Metric label="Applicants" value={c.applicants} loading={loading} />
+        <Metric label="Active IDs" value={c.activeIDs} loading={loading} />
+        <Metric label="Partial" value={c.partial} warn loading={loading} />
       </div>
     </div>
   );

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Download, FileSpreadsheet } from 'lucide-react';
 import { reportsService } from '../../services/reportsService';
@@ -11,11 +11,10 @@ function formatDate(iso) {
 
 export default function ReportsPage() {
   const { data: reports } = useQuery({ queryKey: ['reports-list'], queryFn: reportsService.listReports, staleTime: 5 * 60_000 });
-  const [selectedId, setSelectedId] = useState(null);
-
-  useEffect(() => {
-    if (reports?.length && !selectedId) setSelectedId(reports[0].id);
-  }, [reports, selectedId]);
+  const [selectedIdOverride, setSelectedIdOverride] = useState(null);
+  const selectedId = reports?.some((item) => item.id === selectedIdOverride)
+    ? selectedIdOverride
+    : (reports?.[0]?.id ?? null);
 
   const { data: report, isLoading } = useQuery({
     queryKey: ['report', selectedId],
@@ -55,7 +54,7 @@ export default function ReportsPage() {
           {reports.map((r) => (
             <button
               key={r.id}
-              onClick={() => setSelectedId(r.id)}
+              onClick={() => setSelectedIdOverride(r.id)}
               className="rounded-lg px-3 py-1.5 text-xs font-medium transition-colors"
               style={selectedId === r.id
                 ? { background: 'var(--color-text-1)', color: '#fff' }

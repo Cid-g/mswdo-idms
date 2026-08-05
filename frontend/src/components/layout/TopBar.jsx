@@ -98,8 +98,11 @@ export default function TopBar() {
     };
   }, [dropdownOpen]);
 
-  // Close dropdown on route change
-  useEffect(() => { setDropdownOpen(false); }, [location.pathname]);
+  // Route changes close the menu on the next task without synchronously setting state in the effect.
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDropdownOpen(false), 0);
+    return () => window.clearTimeout(timer);
+  }, [location.pathname]);
 
   return (
     <header
@@ -183,7 +186,7 @@ export default function TopBar() {
       {/* ── Right: Avatar + dropdown ────────────────────────────── */}
       <div className="relative flex-shrink-0" ref={dropdownRef}>
         <button
-          onClick={() => setDropdownOpen((v) => !v)}
+          onClick={() => setDropdownOpen((current) => !current)}
           aria-expanded={dropdownOpen}
           aria-haspopup="true"
           aria-label="Open user menu"

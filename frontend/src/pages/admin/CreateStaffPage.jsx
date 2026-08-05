@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
@@ -17,6 +17,12 @@ const DEPT_GRADIENT = {
 const DEPT_LABEL = {
   PWD: 'Persons with Disability', SOLO_PARENT: 'Solo Parent', SENIOR_CITIZEN: 'Senior Citizen',
 };
+
+function buildUsername(firstName, lastName) {
+  const first = firstName.toLowerCase().replace(/\s+/g, '');
+  const last = lastName.toLowerCase().replace(/\s+/g, '');
+  return first || last ? `${first}.${last}` : '';
+}
 
 // ─── Password strength ─────────────────────────────────────────────────────
 function getStrength(pwd) {
@@ -64,6 +70,7 @@ export default function CreateStaffPage() {
     register,
     handleSubmit,
     watch,
+    getValues,
     setValue,
     setError,
     formState: { errors, isSubmitting },
@@ -76,21 +83,19 @@ export default function CreateStaffPage() {
     },
   });
 
-  // Auto-suggest username from name
-  const firstName = watch('firstName');
-  const lastName  = watch('lastName');
-  const username  = watch('username');
-  const [autoUsername, setAutoUsername] = useState('');
+  const suggestedUsernameRef = useRef('');
 
-  useEffect(() => {
-    if (!firstName && !lastName) return;
-    const suggestion = `${firstName?.toLowerCase().replace(/\s+/g, '') ?? ''}.${lastName?.toLowerCase().replace(/\s+/g, '') ?? ''}`;
-    setAutoUsername(suggestion);
-    if (!username || username === autoUsername) {
-      setValue('username', suggestion, { shouldValidate: false });
+  function updateSuggestedUsername(nextFirstName, nextLastName) {
+    const suggestion = buildUsername(nextFirstName, nextLastName);
+    const currentUsername = getValues('username');
+    if (!currentUsername || currentUsername === suggestedUsernameRef.current) {
+      setValue('username', suggestion, { shouldValidate: false, shouldDirty: true });
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [firstName, lastName]);
+    suggestedUsernameRef.current = suggestion;
+  }
+
+  const firstNameRegistration = register('firstName');
+  const lastNameRegistration = register('lastName');
 
   const password = watch('password');
   const strength = getStrength(password);
@@ -162,7 +167,11 @@ export default function CreateStaffPage() {
           <div className="grid grid-cols-2 gap-3">
             <Field label="First Name" required error={errors.firstName?.message}>
               <input
-                {...register('firstName')}
+                {...firstNameRegistration}
+                onChange={(event) => {
+                  firstNameRegistration.onChange(event);
+                  updateSuggestedUsername(event.target.value, getValues('lastName'));
+                }}
                 placeholder="e.g. Juan"
                 className={cn(inputCls, errors.firstName && 'border-danger focus:ring-red-200')}
                 disabled={isSubmitting}
@@ -170,7 +179,11 @@ export default function CreateStaffPage() {
             </Field>
             <Field label="Last Name" required error={errors.lastName?.message}>
               <input
-                {...register('lastName')}
+                {...lastNameRegistration}
+                onChange={(event) => {
+                  lastNameRegistration.onChange(event);
+                  updateSuggestedUsername(getValues('firstName'), event.target.value);
+                }}
                 placeholder="e.g. Dela Cruz"
                 className={cn(inputCls, errors.lastName && 'border-danger focus:ring-red-200')}
                 disabled={isSubmitting}

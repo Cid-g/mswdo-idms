@@ -21,7 +21,6 @@ const SP_EDU = ['No Education','Elementary Level','Elementary Graduate','High Sc
 const SP_INCOME = ['No income','minimum wage and below','(minimum wage +1) to Php 20833','Php 20834 and above'];
 const SC_MARITAL = ['Single','Married','Widowed','Separated','Divorced'];
 const SC_TX_TYPE = ['New','Replace','Loss','Transfer'];
-const DEPT_LABEL    = { PWD: 'Persons with Disability', SOLO_PARENT: 'Solo Parent', SENIOR_CITIZEN: 'Senior Citizen' };
 const DEPT_ACCENT   = { PWD: '#1E40AF', SOLO_PARENT: '#9F1239', SENIOR_CITIZEN: '#92400E' };
 const DEPT_GRADIENT = {
   PWD:            'linear-gradient(135deg, #1E3A8A 0%, #1E40AF 60%, #2563EB 100%)',
@@ -77,6 +76,24 @@ function FL({ label, req, children }) {
       </label>
       {children}
     </div>
+  );
+}
+
+function MissingWarning({ show }) {
+  return show ? <p className="mt-0.5 text-xs text-amber-600">Not yet filled</p> : null;
+}
+
+function BooleanSelect({ value, onChange }) {
+  return (
+    <select
+      value={value === null || value === undefined ? '' : String(value)}
+      onChange={(event) => onChange(event.target.value === '' ? null : event.target.value === 'true')}
+      className={selectCls}
+    >
+      <option value="">— Select —</option>
+      <option value="true">Yes</option>
+      <option value="false">No</option>
+    </select>
   );
 }
 
@@ -262,26 +279,26 @@ function AccordionSection({ id, title, status, missingCount = 0, isOpen, onToggl
 }
 
 // ── Main page ─────────────────────────────────────────────────────────────────
-export default function ApplicantDetailPage() {
-  const { id }      = useParams();
+function ApplicantDetailContent({ id, applicant }) {
   const navigate    = useNavigate();
   const queryClient = useQueryClient();
 
-  const [form, setForm]                     = useState(null);
-  const [openSections, setOpenSections]     = useState(null);
+  const [form, setForm] = useState(() => toForm(applicant));
+  const [openSections, setOpenSections] = useState(() => {
+    const initialForm = toForm(applicant);
+    const sections = SECTIONS[applicant.department] ?? [];
+    const firstIncomplete = sections.find((section) => (
+      getSectionStatus(section, initialForm, applicant.photoPath, applicant.signaturePath) !== 'complete'
+    ));
+    return new Set(firstIncomplete ? [firstIncomplete.id] : []);
+  });
   const [savingSection, setSavingSection]   = useState(null);
   const [savedSection, setSavedSection]     = useState(null);
   const [saveError, setSaveError]           = useState('');
   const [toast, setToast]                   = useState(null);
   const [headerPhotoUrl, setHeaderPhotoUrl] = useState(null);
   const [isDirty, setIsDirty]               = useState(false);
-  const isDirtyRef   = useRef(false);
-  const previousStatusRef = useRef(null);
-
-  const { data: applicant, isLoading, error } = useQuery({
-    queryKey: ['applicant', id],
-    queryFn: () => applicantService.getApplicantById(id),
-  });
+  const previousStatusRef = useRef(applicant.status);
 
   // Check whether an ID card has been generated (null = none, object = exists)
   const { data: idRecord } = useQuery({
@@ -290,9 +307,9 @@ export default function ApplicantDetailPage() {
       try {
         const { data } = await api.get('/id-records', { params: { applicantId: id } });
         return data;
-      } catch (e) {
-        if (e.response?.status === 404) return null;
-        throw e;
+      } catch (queryError) {
+        if (queryError.response?.status === 404) return null;
+        throw queryError;
       }
     },
     retry: false,
@@ -300,45 +317,52 @@ export default function ApplicantDetailPage() {
   });
 
   useEffect(() => {
-    if (applicant && form === null) {
-      const f = toForm(applicant);
-      setForm(f);
-      const secs = SECTIONS[applicant.department] ?? [];
-      const pp = applicant.photoPath, sp = applicant.signaturePath;
-      const first = secs.find((s) => getSectionStatus(s, f, pp, sp) !== 'complete');
-      setOpenSections(new Set(first ? [first.id] : []));
-    }
-  }, [applicant]);
-
-  useEffect(() => {
-    if (!applicant) return;
-    if (previousStatusRef.current === 'PARTIAL' && applicant.status === 'COMPLETE') {
-      showToast('Profile complete. Blockchain sync queued.', 'success');
-    }
+    const previousStatus = previousStatusRef.current;
     previousStatusRef.current = applicant.status;
-  }, [applicant?.status]);
+    if (previousStatus !== 'PARTIAL' || applicant.status !== 'COMPLETE') return undefined;
+
+    let clearToastTimer;
+    const notifyTimer = window.setTimeout(() => {
+      setToast({ message: 'Profile complete. Blockchain sync queued.', type: 'success' });
+      clearToastTimer = window.setTimeout(() => setToast(null), 4000);
+    }, 0);
+
+    return () => {
+      window.clearTimeout(notifyTimer);
+      if (clearToastTimer) window.clearTimeout(clearToastTimer);
+    };
+  }, [applicant.status]);
 
   // Fetch header thumbnail as authenticated blob URL to avoid 401 on plain <img src>
   useEffect(() => {
-    if (!applicant?.photoPath) { setHeaderPhotoUrl(null); return; }
-    const apiUrl = applicantService.getFileUrl(applicant.photoPath);
     let active = true;
+    if (!applicant.photoPath) {
+      const clearTimer = window.setTimeout(() => {
+        if (active) setHeaderPhotoUrl(null);
+      }, 0);
+      return () => {
+        active = false;
+        window.clearTimeout(clearTimer);
+      };
+    }
+
+    const apiUrl = applicantService.getFileUrl(applicant.photoPath);
     applicantService.fetchFileBlob(apiUrl)
       .then((blobUrl) => { if (active) setHeaderPhotoUrl(blobUrl); })
       .catch(() => { if (active) setHeaderPhotoUrl(null); });
     return () => { active = false; };
-  }, [applicant?.photoPath]);
+  }, [applicant.photoPath]);
 
   // Warn on browser close/refresh when there are unsaved changes
   useEffect(() => {
-    function handleBeforeUnload(e) {
-      if (!isDirtyRef.current) return;
-      e.preventDefault();
-      e.returnValue = '';
+    function handleBeforeUnload(event) {
+      if (!isDirty) return;
+      event.preventDefault();
+      event.returnValue = '';
     }
     window.addEventListener('beforeunload', handleBeforeUnload);
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-  }, []);
+  }, [isDirty]);
 
   const saveMutation = useMutation({
     mutationFn: async (formData) => {
@@ -364,20 +388,13 @@ export default function ApplicantDetailPage() {
     onError: (err) => setSaveError(err?.response?.data?.message ?? 'Save failed. Please try again.'),
   });
 
-  function showToast(message, type = 'info') {
-    setToast({ message, type });
-    setTimeout(() => setToast(null), 4000);
-  }
-
   function setField(key, value) {
     setForm((prev) => ({ ...prev, [key]: value }));
     setIsDirty(true);
-    isDirtyRef.current = true;
   }
 
   function clearDirty() {
     setIsDirty(false);
-    isDirtyRef.current = false;
   }
 
   async function handleSectionSave(sectionId) {
@@ -417,25 +434,6 @@ export default function ApplicantDetailPage() {
     setOpenSections(new Set(secs.filter((s) => getSectionStatus(s, form, pp, sp) !== 'complete').map((s) => s.id)));
   }
 
-  // ── Loading / error ────────────────────────────────────────────────────────
-  if (isLoading || !form || !openSections) {
-    return (
-      <div className="space-y-4">
-        <div className="h-5 w-32 bg-gray-200 rounded animate-pulse" />
-        <div className="h-40 bg-gray-200 rounded-2xl animate-pulse" />
-        {[...Array(6)].map((_, i) => <div key={i} className="h-14 bg-gray-200 rounded-xl animate-pulse" />)}
-      </div>
-    );
-  }
-  if (error) {
-    return (
-      <div className="text-center py-16">
-        <p className="font-medium text-text-1">Could not load applicant.</p>
-        <button onClick={() => navigate('/staff/applicants')} className="mt-2 text-sm text-muted hover:text-text-1 transition-colors">← Back to list</button>
-      </div>
-    );
-  }
-
   const dept      = applicant.department;
   const accent    = DEPT_ACCENT[dept] ?? '#334155';
   const photoPath = applicant.photoPath;
@@ -466,22 +464,6 @@ export default function ApplicantDetailPage() {
   const miss    = (key) => reqFlat.includes(key) && !isFilled(form, key);
   const ic      = (key) => cn(inputCls,   miss(key) && 'border-amber-400 bg-amber-50/50');
   const sc      = (key) => cn(selectCls,  miss(key) && 'border-amber-400 bg-amber-50/50');
-  const Warn    = ({ fkey }) => miss(fkey) ? <p className="mt-0.5 text-xs text-amber-600">Not yet filled</p> : null;
-
-  function BoolSel({ fkey }) {
-    const v = form[fkey];
-    return (
-      <select
-        value={v === null || v === undefined ? '' : String(v)}
-        onChange={(e) => setField(fkey, e.target.value === '' ? null : e.target.value === 'true')}
-        className={selectCls}
-      >
-        <option value="">— Select —</option>
-        <option value="true">Yes</option>
-        <option value="false">No</option>
-      </select>
-    );
-  }
 
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
@@ -664,14 +646,14 @@ export default function ApplicantDetailPage() {
                   <option value="">— Select —</option>
                   <option value="Male">Male</option><option value="Female">Female</option>
                 </select>
-                <Warn fkey="sex" />
+                <MissingWarning show={miss('sex')} />
               </FL>
               <FL label="Civil Status" req>
                 <select value={form.civilStatus} onChange={(e) => setField('civilStatus', e.target.value)} className={sc('civilStatus')}>
                   <option value="">— Select —</option>
                   {CIVIL_STATUS.map((s) => <option key={s} value={s}>{s}</option>)}
                 </select>
-                <Warn fkey="civilStatus" />
+                <MissingWarning show={miss('civilStatus')} />
               </FL>
             </div>
             <div className="grid grid-cols-3 gap-3">
@@ -696,7 +678,7 @@ export default function ApplicantDetailPage() {
                 <option value="">— Select —</option>
                 {PWD_DISABILITY_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
               </select>
-              <Warn fkey="pwd.disabilityType" />
+              <MissingWarning show={miss('pwd.disabilityType')} />
             </FL>
             <FL label="Cause of Disability"><input value={form['pwd.causeOfDisability']} onChange={(e) => setField('pwd.causeOfDisability', e.target.value)} placeholder="e.g. Congenital, Acquired, Accident" className={inputCls} /></FL>
           </AccordionSection>
@@ -735,11 +717,11 @@ export default function ApplicantDetailPage() {
             <div className="grid grid-cols-2 gap-3">
               <FL label="Contact Person" req>
                 <input value={form.emergencyContactName} onChange={(e) => setField('emergencyContactName', e.target.value)} placeholder="Full name" className={ic('emergencyContactName')} />
-                <Warn fkey="emergencyContactName" />
+                <MissingWarning show={miss('emergencyContactName')} />
               </FL>
               <FL label="Contact Number" req>
                 <input value={form.emergencyContactNumber} onChange={(e) => setField('emergencyContactNumber', e.target.value)} placeholder="09XXXXXXXXX" className={ic('emergencyContactNumber')} />
-                <Warn fkey="emergencyContactNumber" />
+                <MissingWarning show={miss('emergencyContactNumber')} />
               </FL>
             </div>
             <div className="grid grid-cols-2 gap-3">
@@ -801,14 +783,14 @@ export default function ApplicantDetailPage() {
                   <option value="">— Select —</option>
                   <option value="Male">Male</option><option value="Female">Female</option>
                 </select>
-                <Warn fkey="sex" />
+                <MissingWarning show={miss('sex')} />
               </FL>
               <FL label="Marital Status" req>
                 <select value={form['seniorCitizen.maritalStatus']} onChange={(e) => setField('seniorCitizen.maritalStatus', e.target.value)} className={sc('seniorCitizen.maritalStatus')}>
                   <option value="">— Select —</option>
                   {SC_MARITAL.map((s) => <option key={s} value={s}>{s}</option>)}
                 </select>
-                <Warn fkey="seniorCitizen.maritalStatus" />
+                <MissingWarning show={miss('seniorCitizen.maritalStatus')} />
               </FL>
             </div>
             <div className="grid grid-cols-3 gap-3">
@@ -840,7 +822,7 @@ export default function ApplicantDetailPage() {
             <FL label="Medicine / Maintenance">
               <input value={form['seniorCitizen.medicine']} onChange={(e) => setField('seniorCitizen.medicine', e.target.value)} placeholder="e.g. Amlodipine, Metformin" className={inputCls} />
             </FL>
-            <FL label="Person with Disability (PWD)?"><BoolSel fkey="seniorCitizen.isDisabled" /></FL>
+            <FL label="Person with Disability (PWD)?"><BooleanSelect value={form['seniorCitizen.isDisabled']} onChange={(value) => setField('seniorCitizen.isDisabled', value)} /></FL>
           </AccordionSection>
 
           <AccordionSection {...accProps('idDetails')}>
@@ -850,14 +832,14 @@ export default function ApplicantDetailPage() {
                   <option value="">— Select —</option>
                   {SC_REGISTRATION_CATEGORY.map((s) => <option key={s} value={s}>{s}</option>)}
                 </select>
-                <Warn fkey="seniorCitizen.registrationCategory" />
+                <MissingWarning show={miss('seniorCitizen.registrationCategory')} />
               </FL>
               <FL label="ID Transaction Type" req>
                 <select value={form['seniorCitizen.idTransactionType']} onChange={(e) => setField('seniorCitizen.idTransactionType', e.target.value)} className={sc('seniorCitizen.idTransactionType')}>
                   <option value="">— Select —</option>
                   {SC_TX_TYPE.map((s) => <option key={s} value={s}>{s}</option>)}
                 </select>
-                <Warn fkey="seniorCitizen.idTransactionType" />
+                <MissingWarning show={miss('seniorCitizen.idTransactionType')} />
               </FL>
             </div>
             <FL label="RRN (Registry Reference Number)">
@@ -866,7 +848,7 @@ export default function ApplicantDetailPage() {
           </AccordionSection>
 
           <AccordionSection {...accProps('pension')}>
-            <FL label="Pensioner?"><BoolSel fkey="seniorCitizen.isPensioner" /></FL>
+            <FL label="Pensioner?"><BooleanSelect value={form['seniorCitizen.isPensioner']} onChange={(value) => setField('seniorCitizen.isPensioner', value)} /></FL>
             <div className="grid grid-cols-2 gap-3">
               <FL label="Pension Type">
                 <select value={form['seniorCitizen.pensionType']} onChange={(e) => setField('seniorCitizen.pensionType', e.target.value)} className={selectCls}>
@@ -901,14 +883,14 @@ export default function ApplicantDetailPage() {
                   <option value="">— Select —</option>
                   <option value="Male">Male</option><option value="Female">Female</option>
                 </select>
-                <Warn fkey="sex" />
+                <MissingWarning show={miss('sex')} />
               </FL>
               <FL label="Civil Status" req>
                 <select value={form.civilStatus} onChange={(e) => setField('civilStatus', e.target.value)} className={sc('civilStatus')}>
                   <option value="">— Select —</option>
                   {CIVIL_STATUS.map((s) => <option key={s} value={s}>{s}</option>)}
                 </select>
-                <Warn fkey="civilStatus" />
+                <MissingWarning show={miss('civilStatus')} />
               </FL>
             </div>
             <div className="grid grid-cols-2 gap-3">
@@ -947,7 +929,7 @@ export default function ApplicantDetailPage() {
                   <option value="">— Select —</option>
                   {EMPLOYMENT_STATUS.map((s) => <option key={s} value={s}>{s}</option>)}
                 </select>
-                <Warn fkey="soloParent.employmentStatus" />
+                <MissingWarning show={miss('soloParent.employmentStatus')} />
               </FL>
             </div>
             <div className="grid grid-cols-2 gap-3">
@@ -967,7 +949,7 @@ export default function ApplicantDetailPage() {
                 <option value="">— Select category —</option>
                 {SOLO_PARENT_CATEGORIES.map(({ code, label }) => <option key={code} value={code}>[{code}] {label}</option>)}
               </select>
-              <Warn fkey="soloParent.categoryCode" />
+              <MissingWarning show={miss('soloParent.categoryCode')} />
             </FL>
             <div className="grid grid-cols-2 gap-3">
               <FL label="SPIC Status">
@@ -990,15 +972,15 @@ export default function ApplicantDetailPage() {
               <p className="mt-0.5 text-xs" style={{ color: 'var(--color-muted)' }}>Printed on ID front — enter the benefit code applicable to this solo parent</p>
             </FL>
             <div className="grid grid-cols-3 gap-3">
-              <FL label="Pantawid Beneficiary?"><BoolSel fkey="soloParent.pantawidBeneficiary" /></FL>
-              <FL label="LGBTQ+?"><BoolSel fkey="soloParent.lgbtq" /></FL>
-              <FL label="Person with Disability?"><BoolSel fkey="soloParent.isPWD" /></FL>
+              <FL label="Pantawid Beneficiary?"><BooleanSelect value={form['soloParent.pantawidBeneficiary']} onChange={(value) => setField('soloParent.pantawidBeneficiary', value)} /></FL>
+              <FL label="LGBTQ+?"><BooleanSelect value={form['soloParent.lgbtq']} onChange={(value) => setField('soloParent.lgbtq', value)} /></FL>
+              <FL label="Person with Disability?"><BooleanSelect value={form['soloParent.isPWD']} onChange={(value) => setField('soloParent.isPWD', value)} /></FL>
             </div>
             <div className="grid grid-cols-2 gap-3">
               <FL label="Indigenous Person (IP)">
                 <input value={form['soloParent.indigenousPerson']} onChange={(e) => setField('soloParent.indigenousPerson', e.target.value)} placeholder="No, or tribal name (e.g. Aeta)" className={inputCls} />
               </FL>
-              <FL label="Senior Citizen?"><BoolSel fkey="soloParent.isSeniorCitizen" /></FL>
+              <FL label="Senior Citizen?"><BooleanSelect value={form['soloParent.isSeniorCitizen']} onChange={(value) => setField('soloParent.isSeniorCitizen', value)} /></FL>
             </div>
           </AccordionSection>
 
@@ -1027,16 +1009,16 @@ export default function ApplicantDetailPage() {
             <div className="grid grid-cols-2 gap-3">
               <FL label="Contact Person" req>
                 <input value={form.emergencyContactName} onChange={(e) => setField('emergencyContactName', e.target.value)} placeholder="Full name" className={ic('emergencyContactName')} />
-                <Warn fkey="emergencyContactName" />
+                <MissingWarning show={miss('emergencyContactName')} />
               </FL>
               <FL label="Contact Number" req>
                 <input value={form.emergencyContactNumber} onChange={(e) => setField('emergencyContactNumber', e.target.value)} placeholder="09XXXXXXXXX" className={ic('emergencyContactNumber')} />
-                <Warn fkey="emergencyContactNumber" />
+                <MissingWarning show={miss('emergencyContactNumber')} />
               </FL>
             </div>
             <FL label="Contact Address" req>
               <input value={form.emergencyContactAddress} onChange={(e) => setField('emergencyContactAddress', e.target.value)} placeholder="Full address" className={ic('emergencyContactAddress')} />
-              <Warn fkey="emergencyContactAddress" />
+              <MissingWarning show={miss('emergencyContactAddress')} />
             </FL>
             <FL label="Relationship to Solo Parent">
               <input value={form.emergencyContactRelation} onChange={(e) => setField('emergencyContactRelation', e.target.value)} placeholder="e.g. Parent, Sibling" className={inputCls} />
@@ -1072,4 +1054,42 @@ export default function ApplicantDetailPage() {
       </div>
     </div>
   );
+}
+
+export default function ApplicantDetailPage() {
+  const { id } = useParams();
+  const navigate = useNavigate();
+  const { data: applicant, isLoading, error } = useQuery({
+    queryKey: ['applicant', id],
+    queryFn: () => applicantService.getApplicantById(id),
+  });
+
+  if (isLoading) {
+    return (
+      <div className="space-y-4">
+        <div className="h-5 w-32 bg-gray-200 rounded animate-pulse" />
+        <div className="h-40 bg-gray-200 rounded-2xl animate-pulse" />
+        {[...Array(6)].map((_, index) => (
+          <div key={index} className="h-14 bg-gray-200 rounded-xl animate-pulse" />
+        ))}
+      </div>
+    );
+  }
+
+  if (error || !applicant) {
+    return (
+      <div className="text-center py-16">
+        <p className="font-medium text-text-1">Could not load applicant.</p>
+        <button
+          type="button"
+          onClick={() => navigate('/staff/applicants')}
+          className="mt-2 text-sm text-muted hover:text-text-1 transition-colors"
+        >
+          ← Back to list
+        </button>
+      </div>
+    );
+  }
+
+  return <ApplicantDetailContent key={id} id={id} applicant={applicant} />;
 }

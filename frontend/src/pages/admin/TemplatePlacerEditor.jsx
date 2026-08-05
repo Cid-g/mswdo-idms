@@ -1430,22 +1430,6 @@ function PropInput({ label, value, onChange }) {
   );
 }
 
-function PropSelect({ label, value, onChange, options }) {
-  return (
-    <div>
-      <label className="block text-xs font-medium mb-1" style={{ color: 'var(--color-text-2)' }}>{label}</label>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="w-full h-8 px-2 rounded-lg border text-xs"
-        style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-1)', background: 'white' }}
-      >
-        {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-      </select>
-    </div>
-  );
-}
-
 function FontFamilyPicker({ value, onChange, accentColor }) {
   return (
     <div>

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Printer, Loader2, Search, X, CreditCard,
@@ -57,20 +57,9 @@ export default function BatchPrintPage() {
     });
   }, []);
 
-  // Fetch queue + auto-load all thumbnails
-  useEffect(() => {
-    api.get('/id-records/print-queue')
-      .then(({ data }) => {
-        setQueue(data);
-        data.forEach((r) => loadImageById(r));
-      })
-      .catch(() => toast.error('Failed to load print queue.'))
-      .finally(() => setLoading(false));
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
   // ── Image loading ──────────────────────────────────────────────────────────
 
-  async function loadImageById(record) {
+  const loadImageById = useCallback(async (record) => {
     const id = record._id;
     if (loadedRef.current.has(id) || loadingRef.current.has(id)) return;
     loadingRef.current.add(id);
@@ -91,7 +80,25 @@ export default function BatchPrintPage() {
     } finally {
       loadingRef.current.delete(id);
     }
-  }
+  }, []);
+
+  // Fetch queue + auto-load all thumbnails
+  useEffect(() => {
+    let active = true;
+    api.get('/id-records/print-queue')
+      .then(({ data }) => {
+        if (!active) return;
+        setQueue(data);
+        data.forEach((record) => loadImageById(record));
+      })
+      .catch(() => {
+        if (active) toast.error('Failed to load print queue.');
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => { active = false; };
+  }, [loadImageById]);
 
   // ── Selection helpers ──────────────────────────────────────────────────────
 

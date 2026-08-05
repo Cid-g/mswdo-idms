@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   CreditCard, Upload, Settings2, Eye, AlertCircle, CheckCircle2,
@@ -33,20 +33,25 @@ function uploaderName(u) {
   return [u.firstName, u.lastName].filter(Boolean).join(' ') || u.username || 'Unknown';
 }
 
+function FilePreview({ file, sideLabel, theme }) {
+  const [previewUrl] = useState(() => URL.createObjectURL(file));
+
+  useEffect(() => () => URL.revokeObjectURL(previewUrl), [previewUrl]);
+
+  return (
+    <img
+      src={previewUrl}
+      alt={`${sideLabel} preview`}
+      className="rounded-lg max-h-32 object-contain w-full mb-1"
+      style={{ border: `1px solid ${theme.accent}40` }}
+    />
+  );
+}
+
 // ── Drop zone for one side inside the upload modal ────────────────────────────
 function SideDropZone({ side, theme, file, setFile, useCurrent, setUseCurrent, currentImageUrl, hasCurrent }) {
   const sideLabel = side === 'front' ? 'Front Side' : 'Back Side';
-  const [preview, setPreview] = useState(null);
   const inputId = `template-${side}-input`;
-
-  useEffect(() => {
-    if (file) {
-      const url = URL.createObjectURL(file);
-      setPreview(url);
-      return () => URL.revokeObjectURL(url);
-    }
-    setPreview(null);
-  }, [file]);
 
   function handleFile(f) {
     if (!f) return;
@@ -101,8 +106,12 @@ function SideDropZone({ side, theme, file, setFile, useCurrent, setUseCurrent, c
         />
         {showingNew ? (
           <>
-            <img src={preview} alt={`${sideLabel} preview`} className="rounded-lg max-h-32 object-contain w-full mb-1"
-              style={{ border: `1px solid ${theme.accent}40` }} />
+            <FilePreview
+              key={`${file.name}-${file.size}-${file.lastModified}`}
+              file={file}
+              sideLabel={sideLabel}
+              theme={theme}
+            />
             <span className="text-xs font-medium mt-1" style={{ color: theme.accent }}>New file selected</span>
           </>
         ) : showingCurrent ? (
@@ -548,41 +557,66 @@ export default function IDTemplatesPage() {
   const [activeVersion,   setActiveVersion]   = useState(null);
   const [versions,        setVersions]        = useState([]);
   const [historyLoading,  setHistoryLoading]  = useState(false);
-  const [loading,         setLoading]         = useState(true);
+  const [loadedDept,      setLoadedDept]      = useState(null);
+  const [refreshing,      setRefreshing]      = useState(true);
+  const loading = loadedDept !== dept || refreshing;
   const [showUpload,      setShowUpload]      = useState(false);
   const [confirmActivate, setConfirmActivate] = useState(null);
   const [activating,      setActivating]      = useState(false);
   const [successMsg,      setSuccessMsg]      = useState('');
 
-  const loadHistory = useCallback(async (templateId) => {
-    if (!templateId) return;
-    setHistoryLoading(true);
-    try {
-      const result = await listVersions(templateId);
-      setVersions(result.versions);
-    } catch { /* silent */ } finally {
-      setHistoryLoading(false);
-    }
-  }, []);
-
-  const fetchData = useCallback(async () => {
-    setLoading(true);
-    setTemplate(null);
-    setActiveVersion(null);
-    setVersions([]);
+  const loadTemplateData = useCallback(async () => {
     try {
       const result = await getTemplate(dept);
-      setTemplate(result.template);
-      setActiveVersion(result.activeVersion);
-      if (result.template?._id) loadHistory(result.template._id);
+      let nextVersions = [];
+      if (result.template?._id) {
+        try {
+          const history = await listVersions(result.template._id);
+          nextVersions = history.versions;
+        } catch {
+          /* Keep the template visible when only history loading fails. */
+        }
+      }
+      return {
+        template: result.template,
+        activeVersion: result.activeVersion,
+        versions: nextVersions,
+      };
     } catch {
-      /* 404 OK — no template yet for this dept */
-    } finally {
-      setLoading(false);
+      return { template: null, activeVersion: null, versions: [] };
     }
-  }, [dept, loadHistory]);
+  }, [dept]);
 
-  useEffect(() => { fetchData(); }, [fetchData]);
+  const applyTemplateData = useCallback((data) => {
+    setTemplate(data.template);
+    setActiveVersion(data.activeVersion);
+    setVersions(data.versions);
+    setLoadedDept(dept);
+  }, [dept]);
+
+  const fetchData = useCallback(async () => {
+    setRefreshing(true);
+    setHistoryLoading(true);
+    try {
+      const data = await loadTemplateData();
+      applyTemplateData(data);
+    } finally {
+      setHistoryLoading(false);
+      setRefreshing(false);
+    }
+  }, [applyTemplateData, loadTemplateData]);
+
+  useEffect(() => {
+    let active = true;
+    loadTemplateData()
+      .then((data) => { if (active) applyTemplateData(data); })
+      .finally(() => {
+        if (!active) return;
+        setHistoryLoading(false);
+        setRefreshing(false);
+      });
+    return () => { active = false; };
+  }, [applyTemplateData, loadTemplateData]);
 
   function handleUploadSuccess(newVersion) {
     setShowUpload(false);
