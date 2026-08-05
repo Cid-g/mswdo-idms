@@ -17,7 +17,10 @@ jest.mock('@grpc/grpc-js', () => {
     Client: jest.fn(),
   };
 });
-jest.mock('@hyperledger/fabric-gateway', () => ({ connect: jest.fn() }));
+jest.mock('@hyperledger/fabric-gateway', () => ({
+  connect: jest.fn(),
+  signers: { newPrivateKeySigner: jest.fn() },
+}));
 
 let fs = require('node:fs');
 let grpc = require('@grpc/grpc-js');
@@ -166,6 +169,7 @@ describe('reconnecting Fabric access', () => {
       path === 'key.pem' ? testPrivateKey : Buffer.from('certificate')
     ));
     grpc.credentials.createSsl.mockReturnValue({ secure: true });
+    fabricGateway.signers.newPrivateKeySigner.mockReturnValue(jest.fn(async (digest) => Buffer.from(digest)));
   });
 
   afterEach(async () => {
@@ -192,6 +196,11 @@ describe('reconnecting Fabric access', () => {
 
     await Promise.resolve();
     expect(fabricGateway.connect).toHaveBeenCalledTimes(1);
+    expect(fabricGateway.signers.newPrivateKeySigner).toHaveBeenCalledTimes(1);
+    expect(fabricGateway.connect.mock.calls[0][0].signer).toBe(
+      fabricGateway.signers.newPrivateKeySigner.mock.results[0].value
+    );
+    expect(typeof fabricGateway.connect.mock.calls[0][0].signer).toBe('function');
     expect(fabric.isFabricConnected()).toBe(false);
     expect(gateway.contract.evaluateTransaction)
       .toHaveBeenCalledWith('verifyID', '__health__');
@@ -342,6 +351,7 @@ describe('immutable Fabric command execution', () => {
       path === 'key.pem' ? testPrivateKey : Buffer.from('certificate')
     ));
     grpc.credentials.createSsl.mockReturnValue({ secure: true });
+    fabricGateway.signers.newPrivateKeySigner.mockReturnValue(jest.fn(async (digest) => Buffer.from(digest)));
   });
 
   afterEach(() => {

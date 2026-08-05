@@ -1,6 +1,6 @@
 'use strict';
 
-const { connect } = require('@hyperledger/fabric-gateway');
+const { connect, signers } = require('@hyperledger/fabric-gateway');
 const grpc = require('@grpc/grpc-js');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -82,9 +82,7 @@ async function openAndProbe(attempt) {
         mspId: process.env.FABRIC_MSP_ID,
         credentials: Buffer.from(certificatePem),
       },
-      signer: {
-        sign: (digest) => crypto.sign(undefined, Buffer.from(digest), privateKey),
-      },
+      signer: signers.newPrivateKeySigner(privateKey),
     });
     attempt.connection.gateway = localGateway;
 
