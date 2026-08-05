@@ -7,6 +7,7 @@ const { buildRecordEnvelope } = require('../src/crypto/canonicalEnvelope');
 const {
   SignatureVerificationError,
   verifyRecordSyncRequest,
+  verifyStoredRecordSignature,
 } = require('../src/crypto/signatureVerifier');
 
 const NOW = 1785940200123;
@@ -53,6 +54,18 @@ test('verifies a valid Ed25519 signature over the exact canonical bytes', () => 
   assert.equal(result.signature, request.signatureBase64);
   assert.equal(result.envelope.keyId, 'office-key-2026-01');
   assert.equal(result.envelope.timestamp, NOW);
+});
+
+test('re-verifies persisted signed bytes without treating their historical timestamp as a replay', () => {
+  const request = signedRequest({ timestamp: NOW - (365 * 24 * 60 * 60 * 1000) });
+  assert.doesNotThrow(() => verifyStoredRecordSignature({
+    audience: request.audience,
+    method: request.method,
+    path: request.path,
+    publicKeys: request.publicKeys,
+    signatureBase64: request.signatureBase64,
+    signedPayload: request.signedPayload,
+  }));
 });
 
 test('accepts signed timestamps exactly on either replay-window boundary', () => {

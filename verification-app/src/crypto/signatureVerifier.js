@@ -83,34 +83,24 @@ function parseHeaderTimestamp(value) {
   return parsed;
 }
 
-function verifyRecordSyncRequest({
+function parseSignedEnvelope(signedPayload) {
+  try {
+    return parseCanonicalRecordEnvelope(signedPayload);
+  } catch (error) {
+    if (error instanceof EnvelopeValidationError) throw error;
+    throw new SignatureVerificationError('Signed envelope could not be parsed.', 'INVALID_SIGNED_ENVELOPE', 400);
+  }
+}
+
+function verifyStoredRecordSignature({
   audience,
-  headerKeyId,
-  headerTimestamp,
-  maxClockSkewMs,
-  method,
-  now = Date.now(),
+  method = 'POST',
   path,
   publicKeys,
   signatureBase64,
   signedPayload,
 }) {
-  let envelope;
-  try {
-    envelope = parseCanonicalRecordEnvelope(signedPayload);
-  } catch (error) {
-    if (error instanceof EnvelopeValidationError) throw error;
-    throw new SignatureVerificationError('Signed envelope could not be parsed.', 'INVALID_SIGNED_ENVELOPE', 400);
-  }
-
-  if (headerKeyId !== envelope.keyId) {
-    throw new SignatureVerificationError('X-Key-Id does not match the signed envelope.', 'KEY_ID_MISMATCH', 400);
-  }
-
-  const parsedHeaderTimestamp = parseHeaderTimestamp(headerTimestamp);
-  if (parsedHeaderTimestamp !== envelope.timestamp) {
-    throw new SignatureVerificationError('X-Timestamp does not match the signed envelope.', 'TIMESTAMP_MISMATCH', 400);
-  }
+  const envelope = parseSignedEnvelope(signedPayload);
 
   if (method !== envelope.method) {
     throw new SignatureVerificationError('HTTP method does not match the signed envelope.', 'METHOD_MISMATCH', 400);
@@ -120,14 +110,6 @@ function verifyRecordSyncRequest({
   }
   if (audience !== envelope.audience) {
     throw new SignatureVerificationError('Audience does not match the signed envelope.', 'AUDIENCE_MISMATCH', 400);
-  }
-
-  if (!Number.isSafeInteger(now) || !Number.isSafeInteger(maxClockSkewMs) || maxClockSkewMs <= 0) {
-    throw new TypeError('now and maxClockSkewMs must be valid safe integers.');
-  }
-
-  if (Math.abs(now - envelope.timestamp) > maxClockSkewMs) {
-    throw new SignatureVerificationError('Signed request timestamp is outside the accepted window.', 'STALE_SIGNED_REQUEST');
   }
 
   const signature = decodeSignature(signatureBase64);
@@ -144,11 +126,55 @@ function verifyRecordSyncRequest({
   });
 }
 
+function verifyRecordSyncRequest({
+  audience,
+  headerKeyId,
+  headerTimestamp,
+  maxClockSkewMs,
+  method,
+  now = Date.now(),
+  path,
+  publicKeys,
+  signatureBase64,
+  signedPayload,
+}) {
+  const verified = verifyStoredRecordSignature({
+    audience,
+    method,
+    path,
+    publicKeys,
+    signatureBase64,
+    signedPayload,
+  });
+  const { envelope } = verified;
+
+  if (headerKeyId !== envelope.keyId) {
+    throw new SignatureVerificationError('X-Key-Id does not match the signed envelope.', 'KEY_ID_MISMATCH', 400);
+  }
+
+  const parsedHeaderTimestamp = parseHeaderTimestamp(headerTimestamp);
+  if (parsedHeaderTimestamp !== envelope.timestamp) {
+    throw new SignatureVerificationError('X-Timestamp does not match the signed envelope.', 'TIMESTAMP_MISMATCH', 400);
+  }
+
+  if (!Number.isSafeInteger(now) || !Number.isSafeInteger(maxClockSkewMs) || maxClockSkewMs <= 0) {
+    throw new TypeError('now and maxClockSkewMs must be valid safe integers.');
+  }
+
+  if (Math.abs(now - envelope.timestamp) > maxClockSkewMs) {
+    throw new SignatureVerificationError('Signed request timestamp is outside the accepted window.', 'STALE_SIGNED_REQUEST');
+  }
+
+  return verified;
+}
+
 module.exports = {
   SignatureVerificationError,
   containsPrivateKeyMaterial,
   decodeSignature,
   getEd25519PublicKey,
   parseHeaderTimestamp,
+  parseSignedEnvelope,
   verifyRecordSyncRequest,
+  verifyStoredRecordSignature,
 };
