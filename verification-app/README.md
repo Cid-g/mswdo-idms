@@ -94,3 +94,46 @@ Run all protocol and persistence tests with:
 ```sh
 npm test
 ```
+
+## MongoDB-backed service lifecycle
+
+Phase 2A.3b adds the executable cloud receiver while keeping the local MSWDO application
+untouched. The service uses the official MongoDB Node.js driver. Startup is deliberately
+fail-closed:
+
+1. parse all protocol, listener, MongoDB, and public-key configuration;
+2. reject private or non-Ed25519 material in `VERIFY_PUBLIC_KEYS`;
+3. connect to MongoDB and successfully ping the selected database;
+4. create/confirm the required `verified_records` indexes;
+5. only then open the HTTP listener.
+
+If connection, ping, or index creation fails, no sync listener is exposed. `SIGINT` and
+`SIGTERM` stop accepting requests, drain/force-close HTTP connections within the configured
+grace period, and close MongoDB exactly once. Operational logs contain error class/code only;
+they do not print `MONGODB_URI`, public-key contents, signed envelopes, or database error
+messages.
+
+### Cloud environment
+
+Copy `.env.example` only as a reference. This app reads deployment environment variables
+directly; it does not load `.env` files automatically.
+
+- `MONGODB_URI` — required cloud MongoDB connection string; treat as a secret.
+- `VERIFY_MONGODB_DATABASE` — defaults to `mswdo_verification`.
+- `VERIFY_PUBLIC_KEYS` — required JSON object mapping key IDs to Ed25519 **public** PEM keys.
+- `HOST` / `PORT` — defaults to `0.0.0.0:3002`; hosting platforms normally provide `PORT`.
+- `VERIFY_MONGO_SERVER_SELECTION_TIMEOUT_MS` — startup database selection timeout.
+- `VERIFY_SHUTDOWN_GRACE_MS` — bounded HTTP shutdown grace period.
+- Existing protocol variables continue to control audience, sync path, and replay window.
+
+The office Ed25519 private key must never be copied into this cloud application. Start the
+receiver after setting real environment values:
+
+```sh
+npm ci
+npm start
+```
+
+`GET /healthz` and `HEAD /healthz` provide a minimal no-store liveness response. The listener
+exists only after the startup database/index gate has completed; this endpoint is not the
+signed office-source freshness heartbeat planned for the public verification decision logic.
