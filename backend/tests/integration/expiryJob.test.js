@@ -28,12 +28,12 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  stopExpiryJob();
+  await stopExpiryJob();
   await db.disconnect();
 });
 
 afterEach(async () => {
-  stopExpiryJob();
+  await stopExpiryJob();
   jest.useRealTimers();
   jest.restoreAllMocks();
   await db.clear();
@@ -300,7 +300,7 @@ describe('daily leased expiry job', () => {
     expect(runOnce).toHaveBeenLastCalledWith({ owner: 'expiry-scheduler', now: NOW });
     expect(onError).not.toHaveBeenCalled();
 
-    stopExpiryJob();
+    await stopExpiryJob();
     expect(jest.getTimerCount()).toBe(0);
   });
 });

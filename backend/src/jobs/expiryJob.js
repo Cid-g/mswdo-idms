@@ -15,7 +15,7 @@ const DEFAULT_INTERVAL_MS = 24 * 60 * 60_000;
 
 let startupTimer = null;
 let intervalTimer = null;
-let tickRunning = false;
+let inFlightTick = null;
 let activeOwner = null;
 
 function assertDate(value, fieldName) {
@@ -162,7 +162,7 @@ function startExpiryJob({
   now = () => new Date(),
   onError = reportExpiryError,
 } = {}) {
-  if (startupTimer || intervalTimer) {
+  if (startupTimer || intervalTimer || inFlightTick) {
     return { started: false, owner: activeOwner };
   }
   if (!owner) throw new Error('Expiry job owner is required');
@@ -170,16 +170,20 @@ function startExpiryJob({
     throw new TypeError('intervalMs must be a positive number');
   }
 
-  const tick = async () => {
-    if (tickRunning) return;
-    tickRunning = true;
-    try {
-      await runOnce({ owner, now: now() });
-    } catch (error) {
-      onError(error);
-    } finally {
-      tickRunning = false;
-    }
+  const tick = () => {
+    if (inFlightTick) return inFlightTick;
+
+    const running = Promise.resolve()
+      .then(() => runOnce({ owner, now: now() }))
+      .catch((error) => {
+        onError(error);
+      })
+      .finally(() => {
+        if (inFlightTick === running) inFlightTick = null;
+      });
+
+    inFlightTick = running;
+    return running;
   };
 
   activeOwner = owner;
@@ -194,12 +198,15 @@ function startExpiryJob({
   return { started: true, owner };
 }
 
-function stopExpiryJob() {
+async function stopExpiryJob() {
   if (startupTimer) clearTimeout(startupTimer);
   if (intervalTimer) clearInterval(intervalTimer);
   startupTimer = null;
   intervalTimer = null;
-  tickRunning = false;
+
+  const running = inFlightTick;
+  if (running) await running;
+
   activeOwner = null;
 }
 
