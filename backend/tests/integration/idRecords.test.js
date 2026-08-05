@@ -159,7 +159,7 @@ describe('POST /api/id-records/:id/revoke validation and idempotency', () => {
       idRecordId: record._id,
       recordRef: record.idNumber,
       canonicalHash: 'c'.repeat(64),
-      txId: `tx-${suffix}`,
+      txId: Buffer.from(`tx-${suffix}`).toString('hex').padEnd(64, '0').slice(0, 64),
       blockNumber: 1,
       ledgerEpoch: 'task8-idrecords',
     });

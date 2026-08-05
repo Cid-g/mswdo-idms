@@ -471,16 +471,17 @@ async function revokeIDRecord(req, res, next) {
 
       // Keep transaction operations sequential. Parallel operations on one
       // MongoDB session are unsupported and can fail nondeterministically.
-      const anchorReceipt = await BlockchainAnchor
-        .exists({ idRecordId: updated._id })
+      const anchor = await BlockchainAnchor
+        .findOne({ idRecordId: updated._id })
         .session(session);
-      const anchorIntent = anchorReceipt
+      const anchorIntent = anchor
         ? null
         : await ChainOutbox
           .exists({ idRecordId: updated._id, operation: 'ANCHOR' })
           .session(session);
 
-      if (anchorReceipt || anchorIntent) {
+      let chainSync;
+      if (anchor || anchorIntent) {
         await enqueueChainOp({
           session,
           operationId: operationIdFor('REVOKE', updated._id),
@@ -488,22 +489,36 @@ async function revokeIDRecord(req, res, next) {
           idRecordId: updated._id,
           payload: Object.freeze({ reason: trimmedReason }),
         });
-        return {
-          revokedRecord: updated,
-          chainSync: { state: 'PENDING', operation: 'REVOKE' },
-        };
-      }
-
-      // A PARTIAL card that never entered the ledger cannot be revoked on
-      // Fabric. Local revocation remains authoritative and succeeds.
-      return {
-        revokedRecord: updated,
-        chainSync: {
+        chainSync = { state: 'PENDING', operation: 'REVOKE' };
+      } else {
+        // A PARTIAL card that never entered the ledger cannot be revoked on
+        // Fabric. Local revocation remains authoritative and succeeds.
+        chainSync = {
           state: 'NOT_APPLICABLE',
           operation: 'REVOKE',
           reason: 'NEVER_ANCHORED',
-        },
-      };
+        };
+      }
+
+      // Public verification must receive every terminal revocation, including
+      // IDs that never entered Fabric. The free-text reason remains local and
+      // is intentionally absent from the minimized cloud projection.
+      const applicant = await Applicant.findById(updated.applicantId).session(session);
+      if (!applicant) {
+        const error = new Error('Applicant not found while preparing verification synchronization.');
+        error.code = 'VERIFY_APPLICANT_NOT_FOUND';
+        throw error;
+      }
+      const verification = await enqueueVerificationSync({
+        session,
+        operationId: verificationOperationIdFor('REVOKE', updated._id),
+        idRecordId: updated._id,
+        payload: buildVerificationPayload({ applicant, idRecord: updated, anchor }),
+        epoch: verificationEpoch(),
+      });
+      updated.verifyRevision = verification.revision;
+
+      return { revokedRecord: updated, chainSync };
     });
 
     return res.json({ ...toResponse(revokedRecord), chainSync });

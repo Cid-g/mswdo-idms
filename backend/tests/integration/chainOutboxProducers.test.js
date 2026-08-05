@@ -663,7 +663,7 @@ async function createAnchorReceipt(idRecord, suffix = 'receipt') {
     idRecordId: idRecord._id,
     recordRef: idRecord.idNumber,
     canonicalHash: 'a'.repeat(64),
-    txId: `task8-${suffix}-tx`,
+    txId: Buffer.from(`task8-${suffix}-tx`).toString('hex').padEnd(64, '0').slice(0, 64),
     blockNumber: 8,
     ledgerEpoch: `task8-${suffix}-epoch`,
     receiptState: 'CURRENT',
@@ -716,6 +716,7 @@ describe('critical REVOKE producer', () => {
       status: 'REVOKED',
       revokedReason: 'Lost card reported',
       chainSequence: 1,
+      verifyRevision: 1,
     });
     expect(persisted.revokedAt).toBeInstanceOf(Date);
     expect(persisted.revokedById.toString()).toBe(pwdUser._id.toString());
@@ -728,6 +729,25 @@ describe('critical REVOKE producer', () => {
       sequence: 1,
       payload: { reason: 'Lost card reported' },
     });
+
+    const verification = await VerifyOutbox.findOne({
+      operationId: `verify:revoke:${idRecord._id}`,
+    }).lean();
+    expect(verification).toMatchObject({
+      idRecordId: idRecord._id,
+      revision: 1,
+      state: 'PENDING',
+      payload: {
+        status: 'REVOKED',
+        idNumber: idRecord.idNumber,
+        anchoredHash: 'a'.repeat(64),
+        blockNumber: 8,
+      },
+    });
+    expect(verification.payload).not.toHaveProperty('revokedReason');
+    expect(verification.payload).not.toHaveProperty('reason');
+    expect(JSON.stringify(verification)).not.toContain('Lost card reported');
+    expect(JSON.stringify(verification)).not.toContain(idRecord.qrToken);
     expect(revokeIDOnChain).not.toHaveBeenCalled();
   });
 
@@ -750,10 +770,25 @@ describe('critical REVOKE producer', () => {
       ['ANCHOR', 1],
       ['REVOKE', 2],
     ]);
-    expect((await IDRecord.findById(idRecord._id)).chainSequence).toBe(2);
+    const persisted = await IDRecord.findById(idRecord._id).lean();
+    expect(persisted.chainSequence).toBe(2);
+    expect(persisted.verifyRevision).toBe(1);
+
+    const verification = await VerifyOutbox.findOne({ idRecordId: idRecord._id }).lean();
+    expect(verification).toMatchObject({
+      operationId: `verify:revoke:${idRecord._id}`,
+      revision: 1,
+      payload: {
+        status: 'REVOKED',
+        anchoredAt: null,
+        anchoredHash: null,
+        blockNumber: null,
+        txId: null,
+      },
+    });
   });
 
-  test('rolls back all local revocation metadata when REVOKE enqueue fails', async () => {
+  test('rolls back all local revocation metadata when Fabric REVOKE enqueue fails', async () => {
     const applicant = await Applicant.create(baseApplicant());
     const idRecord = await createActiveId(applicant, 'revoke-rollback');
     await createAnchorReceipt(idRecord, 'rollback');
@@ -772,7 +807,35 @@ describe('critical REVOKE producer', () => {
     expect(persisted.revokedAt).toBeUndefined();
     expect(persisted.revokedById).toBeUndefined();
     expect(persisted.chainSequence).toBe(0);
+    expect(persisted.verifyRevision).toBe(0);
     expect(await ChainOutbox.countDocuments({ operation: 'REVOKE' })).toBe(0);
+    expect(await VerifyOutbox.countDocuments()).toBe(0);
+    expect(await waitForAudit('ID_REVOKED', 0)).toBe(0);
+  });
+
+  test('rolls back local and Fabric revocation intent when verification enqueue fails', async () => {
+    const applicant = await Applicant.create(baseApplicant());
+    const idRecord = await createActiveId(applicant, 'revoke-verification-rollback');
+    await createAnchorReceipt(idRecord, 'verification-rollback');
+    jest.spyOn(VerifyOutbox, 'create')
+      .mockRejectedValueOnce(new Error('forced verification revoke enqueue failure'));
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await supertest(app)
+      .post(`/api/id-records/${idRecord._id}/revoke`)
+      .set('Authorization', `Bearer ${pwdToken}`)
+      .send({ reason: 'Must remain local only after rollback' });
+
+    expect(res.status).toBe(500);
+    const persisted = await IDRecord.findById(idRecord._id).lean();
+    expect(persisted.status).toBe('ACTIVE');
+    expect(persisted.revokedReason).toBeUndefined();
+    expect(persisted.revokedAt).toBeUndefined();
+    expect(persisted.revokedById).toBeUndefined();
+    expect(persisted.chainSequence).toBe(0);
+    expect(persisted.verifyRevision).toBe(0);
+    expect(await ChainOutbox.countDocuments({ idRecordId: idRecord._id })).toBe(0);
+    expect(await VerifyOutbox.countDocuments({ idRecordId: idRecord._id })).toBe(0);
     expect(await waitForAudit('ID_REVOKED', 0)).toBe(0);
   });
 
@@ -792,9 +855,26 @@ describe('critical REVOKE producer', () => {
       operation: 'REVOKE',
       reason: 'NEVER_ANCHORED',
     });
-    expect((await IDRecord.findById(idRecord._id)).status).toBe('REVOKED');
-    expect((await IDRecord.findById(idRecord._id)).chainSequence).toBe(0);
+    const persisted = await IDRecord.findById(idRecord._id).lean();
+    expect(persisted.status).toBe('REVOKED');
+    expect(persisted.chainSequence).toBe(0);
+    expect(persisted.verifyRevision).toBe(1);
     expect(await ChainOutbox.countDocuments({ idRecordId: idRecord._id })).toBe(0);
+
+    const verification = await VerifyOutbox.findOne({ idRecordId: idRecord._id }).lean();
+    expect(verification).toMatchObject({
+      operationId: `verify:revoke:${idRecord._id}`,
+      revision: 1,
+      payload: {
+        status: 'REVOKED',
+        anchoredAt: null,
+        anchoredHash: null,
+        blockNumber: null,
+        txId: null,
+      },
+    });
+    expect(verification.payload).not.toHaveProperty('revokedReason');
+    expect(JSON.stringify(verification)).not.toContain('Card replaced before completion');
   });
 
   test('writes ID_REVOKED audit only after a successful committed response', async () => {
