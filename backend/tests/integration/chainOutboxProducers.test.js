@@ -17,7 +17,7 @@ jest.mock('../../src/services/imageProcessing', () => ({
 
 jest.mock('../../src/services/blockchain', () => {
   const actual = jest.requireActual('../../src/services/blockchain');
-  return { ...actual, anchorIDOnChain: jest.fn() };
+  return { ...actual, anchorIDOnChain: jest.fn(), revokeIDOnChain: jest.fn() };
 });
 
 const supertest = require('supertest');
@@ -30,13 +30,17 @@ const IDRecord = require('../../src/models/IDRecord');
 const IDTemplate = require('../../src/models/IDTemplate');
 const IDTemplateVersion = require('../../src/models/IDTemplateVersion');
 const ChainOutbox = require('../../src/models/ChainOutbox');
+const BlockchainAnchor = require('../../src/models/BlockchainAnchor');
+const AuditLog = require('../../src/models/AuditLog');
+const { withMongoTransaction } = require('../../src/lib/transactions');
+const { enqueueChainOp, operationIdFor } = require('../../src/services/chainOutbox');
 const { generateIDImage } = require('../../src/services/idGeneration');
 const {
   processPhoto,
   saveBase64Signature,
   deleteUploadFile,
 } = require('../../src/services/imageProcessing');
-const { anchorIDOnChain } = require('../../src/services/blockchain');
+const { anchorIDOnChain, revokeIDOnChain } = require('../../src/services/blockchain');
 
 const IDS_DIR = path.resolve(__dirname, '../../uploads/ids');
 const PWD_TYPE = '5. Physical Disability (Orthopedic)';
@@ -79,6 +83,7 @@ beforeEach(() => {
   saveBase64Signature.mockResolvedValue({ relPath: 'signatures/task7-new-signature.png' });
   deleteUploadFile.mockResolvedValue(undefined);
   anchorIDOnChain.mockClear();
+  revokeIDOnChain.mockClear();
 });
 
 afterEach(async () => {
@@ -413,5 +418,167 @@ describe('PARTIAL to COMPLETE ANCHOR producers', () => {
     expect(await ChainOutbox.countDocuments()).toBe(0);
     expect(deleteUploadFile).toHaveBeenCalledWith('photos/task7-new-photo.png');
     expect(deleteUploadFile).not.toHaveBeenCalledWith('photos/original-photo.png');
+  });
+});
+
+
+async function createAnchorReceipt(idRecord, suffix = 'receipt') {
+  return BlockchainAnchor.create({
+    idRecordId: idRecord._id,
+    recordRef: idRecord.idNumber,
+    canonicalHash: 'a'.repeat(64),
+    txId: `task8-${suffix}-tx`,
+    blockNumber: 8,
+    ledgerEpoch: `task8-${suffix}-epoch`,
+    receiptState: 'CURRENT',
+  });
+}
+
+async function enqueuePendingAnchor(idRecord) {
+  return withMongoTransaction((session) => enqueueChainOp({
+    session,
+    operationId: operationIdFor('ANCHOR', idRecord._id),
+    operation: 'ANCHOR',
+    idRecordId: idRecord._id,
+    payload: {
+      canonicalHash: 'b'.repeat(64),
+      idType: idRecord.department,
+      soloParentIdType: '',
+      issuingOffice: 'MSWDO-GERONA-TARLAC',
+    },
+  }));
+}
+
+async function waitForAudit(action, expectedCount, timeoutMs = 1500) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const count = await AuditLog.countDocuments({ action });
+    if (count === expectedCount) return count;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return AuditLog.countDocuments({ action });
+}
+
+describe('critical REVOKE producer', () => {
+  test('commits an anchored ID revocation and PENDING REVOKE together while Fabric is disabled', async () => {
+    const applicant = await Applicant.create(baseApplicant());
+    const idRecord = await createActiveId(applicant, 'revoke-anchored');
+    await createAnchorReceipt(idRecord, 'anchored');
+
+    const res = await supertest(app)
+      .post(`/api/id-records/${idRecord._id}/revoke`)
+      .set('Authorization', `Bearer ${pwdToken}`)
+      .send({ reason: '  Lost card reported  ' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('REVOKED');
+    expect(res.body.revokedReason).toBe('Lost card reported');
+    expect(res.body.chainSync).toEqual({ state: 'PENDING', operation: 'REVOKE' });
+
+    const persisted = await IDRecord.findById(idRecord._id).lean();
+    expect(persisted).toMatchObject({
+      status: 'REVOKED',
+      revokedReason: 'Lost card reported',
+      chainSequence: 1,
+    });
+    expect(persisted.revokedAt).toBeInstanceOf(Date);
+    expect(persisted.revokedById.toString()).toBe(pwdUser._id.toString());
+
+    const revoke = await ChainOutbox.findOne({ operationId: `revoke:${idRecord._id}` }).lean();
+    expect(revoke).toMatchObject({
+      operation: 'REVOKE',
+      state: 'PENDING',
+      recordRef: idRecord.idNumber,
+      sequence: 1,
+      payload: { reason: 'Lost card reported' },
+    });
+    expect(revokeIDOnChain).not.toHaveBeenCalled();
+  });
+
+  test('queues REVOKE after an existing pending ANCHOR with the next sequence', async () => {
+    const applicant = await Applicant.create(baseApplicant());
+    const idRecord = await createActiveId(applicant, 'revoke-after-anchor');
+    const anchor = await enqueuePendingAnchor(idRecord);
+    expect(anchor.sequence).toBe(1);
+
+    const res = await supertest(app)
+      .post(`/api/id-records/${idRecord._id}/revoke`)
+      .set('Authorization', `Bearer ${pwdToken}`)
+      .send({ reason: 'Fraudulent application' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.chainSync).toEqual({ state: 'PENDING', operation: 'REVOKE' });
+
+    const rows = await ChainOutbox.find({ idRecordId: idRecord._id }).sort({ sequence: 1 }).lean();
+    expect(rows.map((row) => [row.operation, row.sequence])).toEqual([
+      ['ANCHOR', 1],
+      ['REVOKE', 2],
+    ]);
+    expect((await IDRecord.findById(idRecord._id)).chainSequence).toBe(2);
+  });
+
+  test('rolls back all local revocation metadata when REVOKE enqueue fails', async () => {
+    const applicant = await Applicant.create(baseApplicant());
+    const idRecord = await createActiveId(applicant, 'revoke-rollback');
+    await createAnchorReceipt(idRecord, 'rollback');
+    jest.spyOn(ChainOutbox, 'create').mockRejectedValueOnce(new Error('forced revoke enqueue failure'));
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await supertest(app)
+      .post(`/api/id-records/${idRecord._id}/revoke`)
+      .set('Authorization', `Bearer ${pwdToken}`)
+      .send({ reason: 'Should roll back' });
+
+    expect(res.status).toBe(500);
+    const persisted = await IDRecord.findById(idRecord._id).lean();
+    expect(persisted.status).toBe('ACTIVE');
+    expect(persisted.revokedReason).toBeUndefined();
+    expect(persisted.revokedAt).toBeUndefined();
+    expect(persisted.revokedById).toBeUndefined();
+    expect(persisted.chainSequence).toBe(0);
+    expect(await ChainOutbox.countDocuments({ operation: 'REVOKE' })).toBe(0);
+    expect(await waitForAudit('ID_REVOKED', 0)).toBe(0);
+  });
+
+  test('revokes a never-anchored PARTIAL ID locally without an impossible Fabric command', async () => {
+    const applicant = await Applicant.create(baseApplicant());
+    const idRecord = await createActiveId(applicant, 'revoke-never-anchored');
+
+    const res = await supertest(app)
+      .post(`/api/id-records/${idRecord._id}/revoke`)
+      .set('Authorization', `Bearer ${pwdToken}`)
+      .send({ reason: 'Card replaced before completion' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('REVOKED');
+    expect(res.body.chainSync).toEqual({
+      state: 'NOT_APPLICABLE',
+      operation: 'REVOKE',
+      reason: 'NEVER_ANCHORED',
+    });
+    expect((await IDRecord.findById(idRecord._id)).status).toBe('REVOKED');
+    expect((await IDRecord.findById(idRecord._id)).chainSequence).toBe(0);
+    expect(await ChainOutbox.countDocuments({ idRecordId: idRecord._id })).toBe(0);
+  });
+
+  test('writes ID_REVOKED audit only after a successful committed response', async () => {
+    const applicant = await Applicant.create(baseApplicant());
+    const idRecord = await createActiveId(applicant, 'revoke-audit');
+    await createAnchorReceipt(idRecord, 'audit');
+
+    const res = await supertest(app)
+      .post(`/api/id-records/${idRecord._id}/revoke`)
+      .set('Authorization', `Bearer ${pwdToken}`)
+      .send({ reason: 'Confirmed duplicate credential' });
+
+    expect(res.status).toBe(200);
+    expect(await waitForAudit('ID_REVOKED', 1)).toBe(1);
+    const audit = await AuditLog.findOne({ action: 'ID_REVOKED' }).lean();
+    expect(audit).toMatchObject({
+      targetType: 'IDRecord',
+      targetId: idRecord._id.toString(),
+      department: 'PWD',
+    });
+    expect(audit.description).toContain('Confirmed duplicate credential');
   });
 });

@@ -6,6 +6,8 @@ const Applicant         = require('../models/Applicant');
 const IDRecord          = require('../models/IDRecord');
 const IDTemplate        = require('../models/IDTemplate');
 const IDTemplateVersion = require('../models/IDTemplateVersion');
+const BlockchainAnchor  = require('../models/BlockchainAnchor');
+const ChainOutbox       = require('../models/ChainOutbox');
 const { generateIDImage } = require('../services/idGeneration');
 const { withMongoTransaction } = require('../lib/transactions');
 const { buildAnchorPayload, enqueueChainOp, operationIdFor } = require('../services/chainOutbox');
@@ -364,20 +366,69 @@ async function revokeIDRecord(req, res, next) {
       return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Cannot revoke an ID from another department.' } });
     }
 
-    record.status        = 'REVOKED';
-    record.revokedReason = reason.trim();
-    record.revokedAt     = new Date();
-    record.revokedById   = req.user.id;
-    await record.save();
+    const trimmedReason = reason.trim();
+    const now = new Date();
 
-    // Revoke on-chain (non-fatal)
-    if (process.env.FABRIC_ENABLED === 'true') {
-      const { revokeIDOnChain } = require('../services/blockchain');
-      revokeIDOnChain(record.idNumber, reason.trim())
-        .catch((err) => console.error('[Blockchain] On-chain revoke failed:', err.message));
-    }
+    const { revokedRecord, chainSync } = await withMongoTransaction(async (session) => {
+      const updated = await IDRecord.findOneAndUpdate(
+        { _id: record._id, status: { $ne: 'REVOKED' } },
+        { $set: {
+          status: 'REVOKED',
+          revokedReason: trimmedReason,
+          revokedAt: now,
+          revokedById: req.user.id,
+        } },
+        { new: true, session }
+      );
 
-    return res.json(toResponse(record));
+      // A concurrent request may revoke the record after the pre-transaction
+      // validation read. Preserve the existing conflict response and do not
+      // create a second lifecycle command.
+      if (!updated) {
+        const conflict = new Error('This ID is already revoked.');
+        conflict.status = 400;
+        conflict.code = 'CONFLICT';
+        throw conflict;
+      }
+
+      // Keep transaction operations sequential. Parallel operations on one
+      // MongoDB session are unsupported and can fail nondeterministically.
+      const anchorReceipt = await BlockchainAnchor
+        .exists({ idRecordId: updated._id })
+        .session(session);
+      const anchorIntent = anchorReceipt
+        ? null
+        : await ChainOutbox
+          .exists({ idRecordId: updated._id, operation: 'ANCHOR' })
+          .session(session);
+
+      if (anchorReceipt || anchorIntent) {
+        await enqueueChainOp({
+          session,
+          operationId: operationIdFor('REVOKE', updated._id),
+          operation: 'REVOKE',
+          idRecordId: updated._id,
+          payload: Object.freeze({ reason: trimmedReason }),
+        });
+        return {
+          revokedRecord: updated,
+          chainSync: { state: 'PENDING', operation: 'REVOKE' },
+        };
+      }
+
+      // A PARTIAL card that never entered the ledger cannot be revoked on
+      // Fabric. Local revocation remains authoritative and succeeds.
+      return {
+        revokedRecord: updated,
+        chainSync: {
+          state: 'NOT_APPLICABLE',
+          operation: 'REVOKE',
+          reason: 'NEVER_ANCHORED',
+        },
+      };
+    });
+
+    return res.json({ ...toResponse(revokedRecord), chainSync });
   } catch (err) {
     next(err);
   }

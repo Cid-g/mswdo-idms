@@ -7,12 +7,15 @@ const db        = require('../dbHelpers');
 const { createTestUser, getToken } = require('../testHelpers');
 const Applicant  = require('../../src/models/Applicant');
 const IDRecord   = require('../../src/models/IDRecord');
+const ChainOutbox = require('../../src/models/ChainOutbox');
+const BlockchainAnchor = require('../../src/models/BlockchainAnchor');
 
 let token;
 let encoderUser;
 
 beforeAll(async () => {
   await db.connect();
+  await Promise.all([IDRecord.syncIndexes(), ChainOutbox.syncIndexes()]);
   encoderUser = await createTestUser({ username: 'enc_ids', role: 'ENCODER', department: 'PWD' });
   token = await getToken(app, 'enc_ids');
 });
@@ -20,7 +23,7 @@ beforeAll(async () => {
 afterAll(async () => { await db.disconnect(); });
 afterEach(async () => {
   const { collections } = mongoose.connection;
-  for (const key of ['applicants', 'idrecords', 'idtemplates', 'sequences', 'auditlogs']) {
+  for (const key of ['applicants', 'idrecords', 'idtemplates', 'sequences', 'auditlogs', 'chainoutboxes', 'blockchainanchors']) {
     if (collections[key]) await collections[key].deleteMany({});
   }
 });
@@ -138,5 +141,70 @@ describe('GET /api/id-records', () => {
 
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe('VALIDATION_ERROR');
+  });
+});
+
+
+describe('POST /api/id-records/:id/revoke validation and idempotency', () => {
+  async function createActiveRecord(suffix) {
+    const applicant = await createApplicant();
+    const record = await IDRecord.create({
+      applicantId: applicant._id,
+      department: 'PWD',
+      idNumber: `PWD-REVOKE-${suffix}`,
+      qrToken: `pwd-revoke-token-${suffix}`,
+      status: 'ACTIVE',
+    });
+    await BlockchainAnchor.create({
+      idRecordId: record._id,
+      recordRef: record.idNumber,
+      canonicalHash: 'c'.repeat(64),
+      txId: `tx-${suffix}`,
+      blockNumber: 1,
+      ledgerEpoch: 'task8-idrecords',
+    });
+    return record;
+  }
+
+  test('preserves the required non-blank revocation reason validation', async () => {
+    const record = await createActiveRecord('reason');
+
+    const res = await supertest(app)
+      .post(`/api/id-records/${record._id}/revoke`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ reason: '   ' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    expect((await IDRecord.findById(record._id)).status).toBe('ACTIVE');
+    expect(await ChainOutbox.countDocuments()).toBe(0);
+  });
+
+  test('returns the existing conflict response on a duplicate request and creates no second operation', async () => {
+    const record = await createActiveRecord('duplicate');
+
+    const first = await supertest(app)
+      .post(`/api/id-records/${record._id}/revoke`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ reason: 'First valid revocation' });
+    expect(first.status).toBe(200);
+
+    const second = await supertest(app)
+      .post(`/api/id-records/${record._id}/revoke`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ reason: 'Second request must conflict' });
+
+    expect(second.status).toBe(400);
+    expect(second.body.error).toMatchObject({
+      code: 'CONFLICT',
+      message: 'This ID is already revoked.',
+    });
+    expect(await ChainOutbox.countDocuments({
+      idRecordId: record._id,
+      operation: 'REVOKE',
+    })).toBe(1);
+    const persisted = await IDRecord.findById(record._id).lean();
+    expect(persisted.revokedReason).toBe('First valid revocation');
+    expect(persisted.chainSequence).toBe(1);
   });
 });

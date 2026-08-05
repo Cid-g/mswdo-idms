@@ -13,6 +13,7 @@ const db        = require('../dbHelpers');
 const { createTestUser, getToken } = require('../testHelpers');
 const Applicant  = require('../../src/models/Applicant');
 const IDRecord   = require('../../src/models/IDRecord');
+const ChainOutbox = require('../../src/models/ChainOutbox');
 
 let pwdToken;
 let pwdEncoder;
@@ -30,7 +31,7 @@ afterAll(async () => { await db.disconnect(); });
 
 afterEach(async () => {
   const { collections } = mongoose.connection;
-  for (const key of ['applicants', 'idrecords', 'auditlogs']) {
+  for (const key of ['applicants', 'idrecords', 'auditlogs', 'chainoutboxes', 'blockchainanchors']) {
     if (collections[key]) await collections[key].deleteMany({});
   }
 });
@@ -126,6 +127,21 @@ describe('Bug #2 — cross-dept access on id-record endpoints', () => {
       .post(`/api/id-records/${rec._id}/reprint`)
       .set('Authorization', `Bearer ${pwdToken}`);
     expect(res.status).toBe(403);
+  });
+
+  test('POST /:id/revoke → 403 for a record in another department and writes nothing', async () => {
+    const rec = await foreignRecord();
+    const res = await supertest(app)
+      .post(`/api/id-records/${rec._id}/revoke`)
+      .set('Authorization', `Bearer ${pwdToken}`)
+      .send({ reason: 'Unauthorized attempt' });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('FORBIDDEN');
+    const persisted = await IDRecord.findById(rec._id).lean();
+    expect(persisted.status).toBe('ACTIVE');
+    expect(persisted.revokedReason).toBeUndefined();
+    expect(await ChainOutbox.countDocuments({ idRecordId: rec._id })).toBe(0);
   });
 
   test('GET /:id → 200 for a record in the user own department', async () => {
