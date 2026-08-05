@@ -55,7 +55,7 @@ const ChainOutboxSchema = new Schema(
     reconciled:      { type: Boolean, default: false },
     completedAt:     Date,
   },
-  { timestamps: true }
+  { timestamps: true, minimize: false }
 );
 
 ChainOutboxSchema.index({ state: 1, nextAttempt: 1 });
