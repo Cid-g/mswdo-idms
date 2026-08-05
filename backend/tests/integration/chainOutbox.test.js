@@ -1,11 +1,13 @@
 'use strict';
 
+const { createHash } = require('node:crypto');
 const mongoose = require('mongoose');
 const db = require('../dbHelpers');
 const Applicant = require('../../src/models/Applicant');
 const BlockchainAnchor = require('../../src/models/BlockchainAnchor');
 const ChainOutbox = require('../../src/models/ChainOutbox');
 const IDRecord = require('../../src/models/IDRecord');
+const VerifyOutbox = require('../../src/models/VerifyOutbox');
 const Sequence = require('../../src/models/Sequence');
 const { withMongoTransaction } = require('../../src/lib/transactions');
 const {
@@ -17,13 +19,25 @@ const {
   processOperationById,
   runChainOutboxOnce,
 } = require('../../src/workers/chainOutboxWorker');
+const { buildVerificationPayload } = require('../../src/services/verificationProjection');
+const {
+  enqueueVerificationSync,
+  verificationOperationIdFor,
+} = require('../../src/services/verifyOutbox');
 
 beforeAll(async () => {
   await db.connect();
-  await ChainOutbox.syncIndexes();
+  await Promise.all([
+    ChainOutbox.syncIndexes(),
+    VerifyOutbox.syncIndexes(),
+  ]);
 });
 afterAll(async () => { await db.disconnect(); });
 afterEach(async () => { await db.clear(); });
+
+function fabricTxId(label) {
+  return createHash('sha256').update(String(label), 'utf8').digest('hex');
+}
 
 function operation(overrides = {}) {
   return {
@@ -69,7 +83,7 @@ function fabricClient(overrides = {}) {
   return {
     ensureFabricConnected: jest.fn().mockResolvedValue({ available: true }),
     executeChainCommand: jest.fn().mockResolvedValue({
-      txId: 'tx-worker',
+      txId: fabricTxId('worker-default'),
       blockNumber: 73,
       ledgerEpoch: 'ledger-epoch-worker',
       reconciled: false,
@@ -95,6 +109,31 @@ async function waitForCall(mock) {
   }
 }
 
+async function ensureAnchorSource({ idRecordId, recordRef, payload }) {
+  const existing = await IDRecord.findById(idRecordId);
+  if (existing) return existing;
+
+  const applicant = await Applicant.create({
+    department: payload.idType ?? 'PWD',
+    encodedById: new mongoose.Types.ObjectId(),
+    lastName: 'Receipt',
+    firstName: 'Test',
+    birthdate: new Date('1980-01-02T00:00:00.000Z'),
+    sex: 'Female',
+    status: 'COMPLETE',
+  });
+  return IDRecord.create({
+    _id: idRecordId,
+    applicantId: applicant._id,
+    department: payload.idType ?? 'PWD',
+    idNumber: recordRef,
+    qrToken: `chain-worker-${idRecordId}`,
+    issuedDate: new Date('2026-08-03T00:00:00.000Z'),
+    expiryDate: new Date('2031-08-03T00:00:00.000Z'),
+    status: 'ACTIVE',
+  });
+}
+
 async function queueOperation(overrides = {}) {
   const idRecordId = overrides.idRecordId ?? new mongoose.Types.ObjectId();
   const operationName = overrides.operation ?? 'ANCHOR';
@@ -106,6 +145,10 @@ async function queueOperation(overrides = {}) {
     soloParentIdType: '',
     issuingOffice: 'MSWDO-GERONA-TARLAC',
   } : {});
+
+  if (operationName === 'ANCHOR') {
+    await ensureAnchorSource({ idRecordId, recordRef, payload });
+  }
 
   return ChainOutbox.create({
     operationId: overrides.operationId
@@ -483,7 +526,11 @@ describe('leased and ordered chain outbox execution', () => {
 
     expect(client.executeChainCommand).toHaveBeenCalledTimes(1);
     const persisted = await ChainOutbox.findById(queued._id).lean();
-    expect(persisted).toMatchObject({ state: 'SENT', attempts: 0, txId: 'tx-worker' });
+    expect(persisted).toMatchObject({
+      state: 'SENT',
+      attempts: 0,
+      txId: fabricTxId('worker-default'),
+    });
   });
 
   test.each([
@@ -510,7 +557,7 @@ describe('leased and ordered chain outbox execution', () => {
     });
 
     execution.resolve({
-      txId: `tx-lease-${expectedMs}`,
+      txId: fabricTxId(`lease-${expectedMs}`),
       blockNumber: 74,
       ledgerEpoch: 'lease-epoch',
       reconciled: false,
@@ -814,9 +861,10 @@ describe('leased and ordered chain outbox execution', () => {
         recordRef: `PWD-ANCHOR-${reconciled}`,
         nextAttempt: now,
       });
+      const txId = fabricTxId(`anchor-${reconciled}`);
       const client = fabricClient({
         executeChainCommand: jest.fn().mockResolvedValue({
-          txId: `tx-anchor-${reconciled}`,
+          txId,
           blockNumber: 91,
           ledgerEpoch: 'ledger-epoch-anchor',
           reconciled,
@@ -828,13 +876,17 @@ describe('leased and ordered chain outbox execution', () => {
         owner: 'anchor-worker', now, clock: () => now, fabricClient: client,
       });
 
-      const [outbox, anchor] = await Promise.all([
+      const [outbox, anchor, verification, idRecord] = await Promise.all([
         ChainOutbox.findById(queued._id).lean(),
         BlockchainAnchor.findOne({ idRecordId }).lean(),
+        VerifyOutbox.findOne({
+          operationId: verificationOperationIdFor('ANCHOR_RECEIPT', idRecordId, txId),
+        }).lean(),
+        IDRecord.findById(idRecordId).lean(),
       ]);
       expect(outbox).toMatchObject({
         state: 'SENT',
-        txId: `tx-anchor-${reconciled}`,
+        txId,
         blockNumber: 91,
         ledgerEpoch: 'ledger-epoch-anchor',
         reconciled,
@@ -846,13 +898,28 @@ describe('leased and ordered chain outbox execution', () => {
         idRecordId,
         recordRef: `PWD-ANCHOR-${reconciled}`,
         canonicalHash: 'a'.repeat(64),
-        txId: `tx-anchor-${reconciled}`,
+        txId,
         blockNumber: 91,
         ledgerEpoch: 'ledger-epoch-anchor',
         receiptState: 'CURRENT',
       });
       if (reconciled) expect(anchor.reconciledAt).toEqual(now);
       else expect(anchor.reconciledAt).toBeUndefined();
+      expect(verification).toMatchObject({
+        idRecordId,
+        state: 'PENDING',
+        epoch: 1,
+        revision: 1,
+        payload: {
+          anchoredAt: now.toISOString(),
+          anchoredHash: 'a'.repeat(64),
+          blockNumber: 91,
+          status: 'ACTIVE',
+          txId,
+        },
+      });
+      expect(JSON.stringify(verification)).not.toContain(idRecord.qrToken);
+      expect(idRecord.verifyRevision).toBe(1);
     }
   );
 
@@ -874,7 +941,7 @@ describe('leased and ordered chain outbox execution', () => {
     await waitForCall(client.executeChainCommand);
     expect(clock).not.toHaveBeenCalled();
     execution.resolve({
-      txId: 'tx-slow-anchor',
+      txId: fabricTxId('slow-anchor'),
       blockNumber: 101,
       ledgerEpoch: 'slow-anchor-epoch',
       reconciled: true,
@@ -904,7 +971,7 @@ describe('leased and ordered chain outbox execution', () => {
       { $set: { lockOwner: 'replacement-owner' } }
     );
     execution.resolve({
-      txId: 'tx-owner-loss',
+      txId: fabricTxId('owner-loss'),
       blockNumber: 99,
       ledgerEpoch: 'owner-loss-epoch',
       reconciled: false,
@@ -912,9 +979,55 @@ describe('leased and ordered chain outbox execution', () => {
     await run;
 
     expect(await BlockchainAnchor.countDocuments({ idRecordId })).toBe(0);
+    expect(await VerifyOutbox.countDocuments({ idRecordId })).toBe(0);
+    expect((await IDRecord.findById(idRecordId)).verifyRevision).toBe(0);
     expect(await ChainOutbox.findById(queued._id).lean()).toMatchObject({
       state: 'PROCESSING',
       lockOwner: 'replacement-owner',
+    });
+  });
+
+  test('rolls back ANCHOR receipt settlement when verification intent collides', async () => {
+    const idRecordId = new mongoose.Types.ObjectId();
+    const queued = await queueOperation({
+      idRecordId,
+      recordRef: 'PWD-VERIFY-COLLISION',
+      nextAttempt: now,
+    });
+    const txId = fabricTxId('verification-collision');
+    const idRecord = await IDRecord.findById(idRecordId);
+    const applicant = await Applicant.findById(idRecord.applicantId);
+    const operationId = verificationOperationIdFor('ANCHOR_RECEIPT', idRecordId, txId);
+
+    await withMongoTransaction((session) => enqueueVerificationSync({
+      session,
+      operationId,
+      idRecordId,
+      payload: buildVerificationPayload({ applicant, idRecord, anchor: null }),
+      epoch: 1,
+    }));
+
+    const result = await runChainOutboxOnce({
+      owner: 'collision-owner',
+      now,
+      fabricClient: fabricClient({
+        executeChainCommand: jest.fn().mockResolvedValue({
+          txId,
+          blockNumber: 102,
+          ledgerEpoch: 'collision-epoch',
+          reconciled: false,
+        }),
+      }),
+    });
+
+    expect(result).toMatchObject({ state: 'PERSISTENCE_FAILED' });
+    expect(result.error).toMatchObject({ code: 'VERIFY_OPERATION_ID_COLLISION' });
+    expect(await BlockchainAnchor.countDocuments({ idRecordId })).toBe(0);
+    expect(await VerifyOutbox.countDocuments({ idRecordId })).toBe(1);
+    expect((await IDRecord.findById(idRecordId)).verifyRevision).toBe(1);
+    expect(await ChainOutbox.findById(queued._id).lean()).toMatchObject({
+      state: 'PROCESSING',
+      lockOwner: 'collision-owner',
     });
   });
 

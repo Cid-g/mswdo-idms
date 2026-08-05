@@ -1,13 +1,30 @@
 const { isDeepStrictEqual } = require('node:util');
 
+const Applicant = require('../models/Applicant');
 const ChainOutbox = require('../models/ChainOutbox');
 const BlockchainAnchor = require('../models/BlockchainAnchor');
 const IDRecord = require('../models/IDRecord');
 const { withMongoTransaction } = require('../lib/transactions');
 const { computeHash } = require('./blockchain');
+const { buildVerificationPayload } = require('./verificationProjection');
+const {
+  enqueueVerificationSync,
+  verificationOperationIdFor,
+} = require('./verifyOutbox');
 
 const DEFAULT_LEASE_MS = 5 * 60_000;
 const RETRY_DELAYS_MS = [30_000, 60_000, 5 * 60_000, 15 * 60_000];
+
+function verificationEpoch() {
+  const raw = process.env.VERIFY_EPOCH ?? '1';
+  const epoch = Number(raw);
+  if (!Number.isSafeInteger(epoch) || epoch < 1) {
+    const error = new Error('VERIFY_EPOCH must be a positive safe integer.');
+    error.code = 'VERIFY_CONFIGURATION_INVALID';
+    throw error;
+  }
+  return epoch;
+}
 
 function operationIdFor(operation, idRecordId) {
   return `${operation.toLowerCase()}:${idRecordId}`;
@@ -217,6 +234,35 @@ async function completeOperation(outbox, { owner, now, receipt }) {
         { $set: anchorFields },
         { upsert: true, session }
       );
+
+      const idRecord = await IDRecord.findById(outbox.idRecordId).session(session);
+      if (!idRecord) {
+        const error = new Error('ID record is missing while publishing an ANCHOR receipt');
+        error.code = 'VERIFY_ANCHOR_ID_RECORD_MISSING';
+        throw error;
+      }
+      const applicant = await Applicant.findById(idRecord.applicantId).session(session);
+      if (!applicant) {
+        const error = new Error('Applicant is missing while publishing an ANCHOR receipt');
+        error.code = 'VERIFY_ANCHOR_APPLICANT_MISSING';
+        throw error;
+      }
+
+      await enqueueVerificationSync({
+        session,
+        operationId: verificationOperationIdFor(
+          'ANCHOR_RECEIPT',
+          idRecord._id,
+          receipt.txId
+        ),
+        idRecordId: idRecord._id,
+        payload: buildVerificationPayload({
+          applicant,
+          idRecord,
+          anchor: anchorFields,
+        }),
+        epoch: verificationEpoch(),
+      });
     }
 
     const result = await ChainOutbox.updateOne(
