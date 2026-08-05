@@ -8,6 +8,7 @@ const IDTemplate        = require('../models/IDTemplate');
 const IDTemplateVersion = require('../models/IDTemplateVersion');
 const BlockchainAnchor  = require('../models/BlockchainAnchor');
 const ChainOutbox       = require('../models/ChainOutbox');
+const VerifyOutbox      = require('../models/VerifyOutbox');
 const { generateIDImage } = require('../services/idGeneration');
 const { withMongoTransaction } = require('../lib/transactions');
 const { buildAnchorPayload, enqueueChainOp, operationIdFor } = require('../services/chainOutbox');
@@ -337,10 +338,62 @@ async function releaseIDRecord(req, res, next) {
     if (deptForbidden(req, record)) {
       return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Access denied.' } });
     }
-    record.releasedAt   = new Date();
-    record.releasedById = req.user.id;
-    await record.save();
-    const populated = await populateRecord(IDRecord.findById(record._id));
+
+    const releasedAt = new Date();
+    const released = await withMongoTransaction(async (session) => {
+      const current = await IDRecord.findById(record._id).session(session);
+      if (!current) {
+        const error = new Error('ID record not found.');
+        error.status = 404;
+        error.code = 'NOT_FOUND';
+        throw error;
+      }
+      if (deptForbidden(req, current)) {
+        const error = new Error('Access denied.');
+        error.status = 403;
+        error.code = 'FORBIDDEN';
+        throw error;
+      }
+
+      const operationId = verificationOperationIdFor('RELEASE', current._id);
+      const existingOperation = await VerifyOutbox.findOne({ operationId }).session(session);
+      if (existingOperation && !current.releasedAt) {
+        const error = new Error('Release synchronization state conflicts with the local ID record.');
+        error.status = 409;
+        error.code = 'VERIFY_RELEASE_STATE_CONFLICT';
+        throw error;
+      }
+
+      if (!current.releasedAt) {
+        current.releasedAt = releasedAt;
+        current.releasedById = req.user.id;
+        await current.save({ session });
+      }
+
+      // A repeated release request is idempotent even when a later lifecycle
+      // event changed the current projection after the original RELEASE snapshot.
+      if (!existingOperation) {
+        const applicant = await Applicant.findById(current.applicantId).session(session);
+        if (!applicant) {
+          const error = new Error('Applicant not found while preparing verification synchronization.');
+          error.code = 'VERIFY_APPLICANT_NOT_FOUND';
+          throw error;
+        }
+        const anchor = await BlockchainAnchor.findOne({ idRecordId: current._id }).session(session);
+        const verification = await enqueueVerificationSync({
+          session,
+          operationId,
+          idRecordId: current._id,
+          payload: buildVerificationPayload({ applicant, idRecord: current, anchor }),
+          epoch: verificationEpoch(),
+        });
+        current.verifyRevision = verification.revision;
+      }
+
+      return current;
+    });
+
+    const populated = await populateRecord(IDRecord.findById(released._id));
     return res.json(toResponse(populated));
   } catch (err) {
     next(err);
@@ -514,7 +567,8 @@ async function batchLogPrint(req, res, next) {
 }
 
 // ── POST /id-records/batch-release ────────────────────────────────────────────
-// Bulk-release a list of ID records by their IDs.
+// Bulk-release a list of ID records by their IDs. Every selected record and its
+// immutable verification intent commit in the same MongoDB transaction.
 async function batchReleaseIDRecords(req, res, next) {
   try {
     const { ids } = req.body;
@@ -522,14 +576,46 @@ async function batchReleaseIDRecords(req, res, next) {
       return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'ids array is required.' } });
     }
 
-    const filter = { _id: { $in: ids }, status: 'ACTIVE', releasedAt: { $exists: false } };
-    if (req.user.role !== 'SUPERADMIN') filter.department = req.user.department;
+    const releasedAt = new Date();
+    const released = await withMongoTransaction(async (session) => {
+      const filter = {
+        _id: { $in: ids },
+        status: 'ACTIVE',
+        $or: [
+          { releasedAt: { $exists: false } },
+          { releasedAt: null },
+        ],
+      };
+      if (req.user.role !== 'SUPERADMIN') filter.department = req.user.department;
 
-    const result = await IDRecord.updateMany(filter, {
-      $set: { releasedAt: new Date(), releasedById: req.user.id },
+      const records = await IDRecord.find(filter).sort({ _id: 1 }).session(session);
+      for (const current of records) {
+        current.releasedAt = releasedAt;
+        current.releasedById = req.user.id;
+        await current.save({ session });
+
+        // Keep session work sequential; parallel operations on one transaction
+        // are unsupported by the MongoDB driver.
+        const applicant = await Applicant.findById(current.applicantId).session(session);
+        if (!applicant) {
+          const error = new Error('Applicant not found while preparing verification synchronization.');
+          error.code = 'VERIFY_APPLICANT_NOT_FOUND';
+          throw error;
+        }
+        const anchor = await BlockchainAnchor.findOne({ idRecordId: current._id }).session(session);
+        await enqueueVerificationSync({
+          session,
+          operationId: verificationOperationIdFor('RELEASE', current._id),
+          idRecordId: current._id,
+          payload: buildVerificationPayload({ applicant, idRecord: current, anchor }),
+          epoch: verificationEpoch(),
+        });
+      }
+
+      return records.length;
     });
 
-    return res.json({ released: result.modifiedCount });
+    return res.json({ released });
   } catch (err) {
     next(err);
   }

@@ -490,6 +490,174 @@ describe('PARTIAL to COMPLETE ANCHOR producers', () => {
 });
 
 
+async function issuePwdIdForRelease() {
+  await installTemplate('PWD', pwdUser._id);
+  const applicant = await Applicant.create(baseApplicant({
+    photoPath: 'photos/existing.png',
+    signaturePath: 'signatures/existing.png',
+  }));
+
+  const issued = await supertest(app)
+    .post('/api/id-records')
+    .set('Authorization', `Bearer ${pwdToken}`)
+    .send({ applicantId: applicant._id.toString() });
+  expect(issued.status).toBe(201);
+
+  const idRecord = await IDRecord.findOne({ applicantId: applicant._id });
+  expect(idRecord).not.toBeNull();
+  return { applicant, idRecord };
+}
+
+describe('verification RELEASE producers', () => {
+  test('commits a single release and minimized verification revision together', async () => {
+    const { idRecord } = await issuePwdIdForRelease();
+
+    const res = await supertest(app)
+      .post(`/api/id-records/${idRecord._id}/release`)
+      .set('Authorization', `Bearer ${pwdToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.releasedAt).toBeTruthy();
+
+    const persisted = await IDRecord.findById(idRecord._id).lean();
+    expect(persisted.releasedAt).toBeInstanceOf(Date);
+    expect(persisted.releasedById.toString()).toBe(pwdUser._id.toString());
+    expect(persisted.verifyRevision).toBe(2);
+
+    const rows = await VerifyOutbox.find({ idRecordId: idRecord._id })
+      .sort({ revision: 1 })
+      .lean();
+    expect(rows.map((row) => [row.operationId, row.revision])).toEqual([
+      [`verify:issue:${idRecord._id}`, 1],
+      [`verify:release:${idRecord._id}`, 2],
+    ]);
+    expect(rows[1].payload).toMatchObject({
+      idNumber: idRecord.idNumber,
+      status: 'ACTIVE',
+      releasedAt: persisted.releasedAt.toISOString(),
+    });
+    expect(rows[1].payload).not.toHaveProperty('releasedById');
+    expect(JSON.stringify(rows[1])).not.toContain(idRecord.qrToken);
+  });
+
+  test('replays a single release idempotently after later anchor state changes', async () => {
+    const { idRecord } = await issuePwdIdForRelease();
+
+    const first = await supertest(app)
+      .post(`/api/id-records/${idRecord._id}/release`)
+      .set('Authorization', `Bearer ${pwdToken}`);
+    expect(first.status).toBe(200);
+
+    await BlockchainAnchor.create({
+      idRecordId: idRecord._id,
+      recordRef: idRecord.idNumber,
+      canonicalHash: 'a'.repeat(64),
+      txId: 'b'.repeat(64),
+      blockNumber: 21,
+      ledgerEpoch: 'release-idempotency-epoch',
+      receiptState: 'CURRENT',
+      anchoredAt: new Date('2026-08-06T00:00:00.000Z'),
+    });
+
+    const second = await supertest(app)
+      .post(`/api/id-records/${idRecord._id}/release`)
+      .set('Authorization', `Bearer ${pwdToken}`);
+
+    expect(second.status).toBe(200);
+    expect(second.body.releasedAt).toBe(first.body.releasedAt);
+    expect(await VerifyOutbox.countDocuments({
+      operationId: `verify:release:${idRecord._id}`,
+    })).toBe(1);
+    expect((await IDRecord.findById(idRecord._id)).verifyRevision).toBe(2);
+  });
+
+  test('rolls back a single release when verification enqueue fails', async () => {
+    const applicant = await Applicant.create(baseApplicant());
+    const idRecord = await createActiveId(applicant, 'release-rollback');
+    jest.spyOn(VerifyOutbox, 'create')
+      .mockRejectedValueOnce(new Error('forced release verification failure'));
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await supertest(app)
+      .post(`/api/id-records/${idRecord._id}/release`)
+      .set('Authorization', `Bearer ${pwdToken}`);
+
+    expect(res.status).toBe(500);
+    const persisted = await IDRecord.findById(idRecord._id).lean();
+    expect(persisted.releasedAt).toBeUndefined();
+    expect(persisted.releasedById).toBeUndefined();
+    expect(persisted.verifyRevision).toBe(0);
+    expect(await VerifyOutbox.countDocuments()).toBe(0);
+  });
+
+  test('commits a batch of releases and one verification intent per ID', async () => {
+    const firstApplicant = await Applicant.create(baseApplicant({ firstName: 'First' }));
+    const secondApplicant = await Applicant.create(baseApplicant({ firstName: 'Second' }));
+    const firstRecord = await createActiveId(firstApplicant, 'batch-release-1');
+    const secondRecord = await createActiveId(secondApplicant, 'batch-release-2');
+
+    const res = await supertest(app)
+      .post('/api/id-records/batch-release')
+      .set('Authorization', `Bearer ${pwdToken}`)
+      .send({ ids: [firstRecord._id.toString(), secondRecord._id.toString()] });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ released: 2 });
+
+    const persisted = await IDRecord.find({
+      _id: { $in: [firstRecord._id, secondRecord._id] },
+    }).sort({ _id: 1 }).lean();
+    expect(persisted).toHaveLength(2);
+    expect(persisted.every((record) => record.releasedAt instanceof Date)).toBe(true);
+    expect(persisted.every((record) => record.verifyRevision === 1)).toBe(true);
+    expect(new Set(persisted.map((record) => record.releasedAt.toISOString())).size).toBe(1);
+
+    const rows = await VerifyOutbox.find({
+      idRecordId: { $in: [firstRecord._id, secondRecord._id] },
+    }).sort({ idRecordId: 1 }).lean();
+    expect(rows).toHaveLength(2);
+    expect(rows.every((row) => row.state === 'PENDING' && row.revision === 1)).toBe(true);
+    expect(rows.map((row) => row.operationId).sort()).toEqual([
+      `verify:release:${firstRecord._id}`,
+      `verify:release:${secondRecord._id}`,
+    ].sort());
+    expect(JSON.stringify(rows)).not.toContain(firstRecord.qrToken);
+    expect(JSON.stringify(rows)).not.toContain(secondRecord.qrToken);
+  });
+
+  test('rolls back the entire batch when any verification enqueue fails', async () => {
+    const firstApplicant = await Applicant.create(baseApplicant({ firstName: 'First' }));
+    const secondApplicant = await Applicant.create(baseApplicant({ firstName: 'Second' }));
+    const firstRecord = await createActiveId(firstApplicant, 'batch-rollback-1');
+    const secondRecord = await createActiveId(secondApplicant, 'batch-rollback-2');
+    const originalCreate = VerifyOutbox.create.bind(VerifyOutbox);
+    let createCalls = 0;
+    jest.spyOn(VerifyOutbox, 'create').mockImplementation((...args) => {
+      createCalls += 1;
+      if (createCalls === 2) {
+        return Promise.reject(new Error('forced second batch verification failure'));
+      }
+      return originalCreate(...args);
+    });
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await supertest(app)
+      .post('/api/id-records/batch-release')
+      .set('Authorization', `Bearer ${pwdToken}`)
+      .send({ ids: [firstRecord._id.toString(), secondRecord._id.toString()] });
+
+    expect(res.status).toBe(500);
+    const persisted = await IDRecord.find({
+      _id: { $in: [firstRecord._id, secondRecord._id] },
+    }).lean();
+    expect(persisted.every((record) => record.releasedAt === undefined)).toBe(true);
+    expect(persisted.every((record) => record.releasedById === undefined)).toBe(true);
+    expect(persisted.every((record) => record.verifyRevision === 0)).toBe(true);
+    expect(await VerifyOutbox.countDocuments()).toBe(0);
+  });
+});
+
+
 async function createAnchorReceipt(idRecord, suffix = 'receipt') {
   return BlockchainAnchor.create({
     idRecordId: idRecord._id,
