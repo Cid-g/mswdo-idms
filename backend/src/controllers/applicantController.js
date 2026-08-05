@@ -12,6 +12,7 @@ const {
   saveBase64Signature,
   deleteUploadFile,
 } = require('../services/imageProcessing');
+const { saveApplicantWithAnchorIntent } = require('../services/applicantCompletion');
 
 // ── Age computation — age is NEVER stored ────────────────────────────────
 function computeAge(birthdate) {
@@ -56,17 +57,6 @@ function isComplete(a) {
     return true; // base check sufficient
   }
   return false;
-}
-
-// ── Blockchain anchor trigger — called after any save that may complete a record
-function triggerAnchorIfComplete(applicant, wasPartial) {
-  if (!wasPartial || applicant.status !== 'COMPLETE') return;
-  if (process.env.FABRIC_ENABLED !== 'true') return;
-  const IDRecord         = require('../models/IDRecord');
-  const { anchorIDOnChain } = require('../services/blockchain');
-  IDRecord.findOne({ applicantId: applicant._id, status: 'ACTIVE' })
-    .then((idRecord) => { if (idRecord) return anchorIDOnChain(applicant, idRecord); })
-    .catch((err) => console.error('[Blockchain] Auto-anchor failed:', err.message));
 }
 
 // ── Base fields allowed in PATCH /applicants/:id ─────────────────────────
@@ -288,8 +278,7 @@ async function updateApplicant(req, res, next) {
       applicant.completedById = req.user.id;
     }
 
-    await applicant.save();
-    triggerAnchorIfComplete(applicant, wasPartial);
+    await saveApplicantWithAnchorIntent(applicant, wasPartial);
     return res.json(serialize(applicant));
   } catch (err) {
     next(err);
@@ -320,8 +309,7 @@ async function updatePwdDetails(req, res, next) {
       applicant.completedById = req.user.id;
     }
 
-    await applicant.save();
-    triggerAnchorIfComplete(applicant, wasPartial);
+    await saveApplicantWithAnchorIntent(applicant, wasPartial);
     return res.json({ pwd: applicant.pwd, status: applicant.status });
   } catch (err) {
     next(err);
@@ -354,8 +342,7 @@ async function updateSoloParentDetails(req, res, next) {
       applicant.completedById = req.user.id;
     }
 
-    await applicant.save();
-    triggerAnchorIfComplete(applicant, wasPartial);
+    await saveApplicantWithAnchorIntent(applicant, wasPartial);
     return res.json({ soloParent: applicant.soloParent, status: applicant.status });
   } catch (err) {
     next(err);
@@ -388,8 +375,7 @@ async function updateSeniorCitizenDetails(req, res, next) {
       applicant.completedById = req.user.id;
     }
 
-    await applicant.save();
-    triggerAnchorIfComplete(applicant, wasPartial);
+    await saveApplicantWithAnchorIntent(applicant, wasPartial);
     return res.json({ seniorCitizen: applicant.seniorCitizen, status: applicant.status });
   } catch (err) {
     next(err);
@@ -411,9 +397,7 @@ async function uploadPhoto(req, res, next) {
       return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Access denied.' } });
     }
 
-    // Delete previous photo if it exists
-    if (applicant.photoPath) await deleteUploadFile(applicant.photoPath);
-
+    const previousPhotoPath = applicant.photoPath;
     const wasPartial = applicant.status === 'PARTIAL';
     const { relPath } = await processPhoto(req.file.buffer);
     applicant.photoPath = relPath;
@@ -423,8 +407,16 @@ async function uploadPhoto(req, res, next) {
       applicant.completedById = req.user.id;
     }
 
-    await applicant.save();
-    triggerAnchorIfComplete(applicant, wasPartial);
+    try {
+      await saveApplicantWithAnchorIntent(applicant, wasPartial);
+    } catch (err) {
+      if (relPath !== previousPhotoPath) await deleteUploadFile(relPath);
+      throw err;
+    }
+
+    if (previousPhotoPath && previousPhotoPath !== relPath) {
+      await deleteUploadFile(previousPhotoPath);
+    }
 
     return res.json({
       photoPath: relPath,
@@ -447,9 +439,7 @@ async function uploadSignature(req, res, next) {
       return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Access denied.' } });
     }
 
-    // Delete previous signature if it exists
-    if (applicant.signaturePath) await deleteUploadFile(applicant.signaturePath);
-
+    const previousSignaturePath = applicant.signaturePath;
     const wasPartial = applicant.status === 'PARTIAL';
     let relPath;
 
@@ -472,8 +462,16 @@ async function uploadSignature(req, res, next) {
       applicant.completedById = req.user.id;
     }
 
-    await applicant.save();
-    triggerAnchorIfComplete(applicant, wasPartial);
+    try {
+      await saveApplicantWithAnchorIntent(applicant, wasPartial);
+    } catch (err) {
+      if (relPath !== previousSignaturePath) await deleteUploadFile(relPath);
+      throw err;
+    }
+
+    if (previousSignaturePath && previousSignaturePath !== relPath) {
+      await deleteUploadFile(previousSignaturePath);
+    }
 
     return res.json({
       signaturePath: relPath,

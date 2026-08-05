@@ -7,6 +7,8 @@ const IDRecord          = require('../models/IDRecord');
 const IDTemplate        = require('../models/IDTemplate');
 const IDTemplateVersion = require('../models/IDTemplateVersion');
 const { generateIDImage } = require('../services/idGeneration');
+const { withMongoTransaction } = require('../lib/transactions');
+const { buildAnchorPayload, enqueueChainOp, operationIdFor } = require('../services/chainOutbox');
 const {
   nextPWDIdNumber,
   nextOSCANumber,
@@ -18,6 +20,17 @@ const IDS_DIR = path.resolve(__dirname, '../../uploads/ids');
 
 // Senior Citizen back is fully static text — no variable placeholders, no back generation
 const DEPT_HAS_BACK = { PWD: true, SOLO_PARENT: true, SENIOR_CITIZEN: false };
+
+function removeGeneratedIDFile(filePath) {
+  if (!filePath) return;
+  try {
+    fs.unlinkSync(filePath);
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      console.warn('[idRecord] Failed to clean generated ID image:', err.message);
+    }
+  }
+}
 
 // Staff/admin may only touch records in their own department. SUPERADMIN bypasses.
 function deptForbidden(req, record) {
@@ -98,6 +111,7 @@ async function createIDRecord(req, res, next) {
 
     // ── ID number ─────────────────────────────────────────────────────────────
     let idNumber;
+    let applicantNeedsSave = false;
     if (applicant.department === 'PWD') {
       idNumber = await nextPWDIdNumber();
     } else if (applicant.department === 'SENIOR_CITIZEN') {
@@ -107,7 +121,7 @@ async function createIDRecord(req, res, next) {
         if (!applicant.seniorCitizen) applicant.seniorCitizen = {};
         applicant.seniorCitizen.oscaNumber = idNumber;
         applicant.markModified('seniorCitizen');
-        await applicant.save();
+        applicantNeedsSave = true;
       }
     } else {
       idNumber = applicant.soloParent?.spicNumber;
@@ -118,7 +132,7 @@ async function createIDRecord(req, res, next) {
         if (!applicant.soloParent.caseNumber) applicant.soloParent.caseNumber = caseNum;
         applicant.soloParent.spicNumber = idNumber;
         applicant.markModified('soloParent');
-        await applicant.save();
+        applicantNeedsSave = true;
       }
     }
 
@@ -144,36 +158,54 @@ async function createIDRecord(req, res, next) {
       };
       try {
         const { buffer: backBuf, filename: backFile } = await generateIDImage(applicant, idData, backTemplate);
-        idImageBackPath = path.join(IDS_DIR, backFile);
-        fs.writeFileSync(idImageBackPath, backBuf);
+        const generatedBackPath = path.join(IDS_DIR, backFile);
+        fs.writeFileSync(generatedBackPath, backBuf);
+        idImageBackPath = generatedBackPath;
       } catch (err) {
         console.warn('[idRecord] Back-side generation failed (non-fatal):', err.message);
       }
     }
 
-    // ── Persist ───────────────────────────────────────────────────────────────
-    const idRecord = await IDRecord.create({
-      applicantId,
-      department:        applicant.department,
-      idNumber,
-      qrToken,
-      issuedDate,
-      expiryDate,
-      status:            'ACTIVE',
-      idImagePath,
-      idImageBackPath,
-      templateVersionId: activeVersion._id,
-    });
+    // ── Persist business state + durable ANCHOR intent atomically ─────────────
+    let idRecord;
+    try {
+      idRecord = await withMongoTransaction(async (session) => {
+        if (applicantNeedsSave) {
+          await applicant.save({ session });
+        }
 
-    // If the applicant profile is already COMPLETE (profile finished BEFORE the ID was
-    // generated), anchor immediately — otherwise the PARTIAL→COMPLETE auto-anchor never
-    // fires for this record. Non-fatal and idempotent (skips if already anchored).
-    if (applicant.status === 'COMPLETE' && process.env.FABRIC_ENABLED === 'true') {
-      const BlockchainAnchor = require('../models/BlockchainAnchor');
-      const { anchorIDOnChain } = require('../services/blockchain');
-      BlockchainAnchor.findOne({ idRecordId: idRecord._id })
-        .then((existing) => { if (!existing) return anchorIDOnChain(applicant, idRecord); })
-        .catch((err) => console.error('[Blockchain] Anchor-on-create failed:', err.message));
+        const [created] = await IDRecord.create([{
+          applicantId,
+          department:        applicant.department,
+          idNumber,
+          qrToken,
+          issuedDate,
+          expiryDate,
+          status:            'ACTIVE',
+          idImagePath,
+          idImageBackPath,
+          templateVersionId: activeVersion._id,
+        }], { session });
+
+        if (applicant.status === 'COMPLETE') {
+          const queued = await enqueueChainOp({
+            session,
+            operationId: operationIdFor('ANCHOR', created._id),
+            operation: 'ANCHOR',
+            idRecordId: created._id,
+            payload: buildAnchorPayload(applicant, created),
+          });
+          created.chainSequence = queued.sequence;
+        }
+
+        return created;
+      });
+    } catch (err) {
+      // Rendering is intentionally outside the transaction. If persistence
+      // fails, remove only the files generated by this request.
+      removeGeneratedIDFile(idImagePath);
+      removeGeneratedIDFile(idImageBackPath);
+      throw err;
     }
 
     const obj = idRecord.toObject();
