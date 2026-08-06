@@ -3,12 +3,15 @@
 const mongoose = require('mongoose');
 
 const {
+  normalizeIdRecordRef,
   normalizeOperationRef,
+  normalizeResyncRequest,
   operationEvent,
   requireSuperadminActor,
   safeFailureClassification,
   serializeVerificationOperation,
   staleProcessingQuery,
+  verificationEpoch,
 } = require('../../src/services/verificationOutboxOperations');
 
 const NOW = new Date('2026-08-06T10:00:00.000Z');
@@ -45,6 +48,38 @@ describe('verification outbox operations helpers', () => {
         code: 'INVALID_VERIFICATION_OPERATION_REF',
         status: 400,
       }));
+  });
+
+
+  test('normalizes only opaque ID-record references', () => {
+    expect(normalizeIdRecordRef('507F1F77BCF86CD799439011'))
+      .toBe('507f1f77bcf86cd799439011');
+    expect(() => normalizeIdRecordRef('PWD-2026-0001'))
+      .toThrow(expect.objectContaining({ code: 'INVALID_ID_RECORD_REF', status: 400 }));
+  });
+
+  test('accepts only an exact privacy-safe resync request shape', () => {
+    expect(normalizeResyncRequest({ requestId: 'recovery-request-001' }))
+      .toEqual({ requestId: 'recovery-request-001' });
+    expect(() => normalizeResyncRequest({
+      requestId: 'recovery-request-001',
+      reason: 'free text is not accepted',
+    })).toThrow(expect.objectContaining({
+      code: 'INVALID_VERIFICATION_RESYNC_REQUEST',
+      status: 400,
+    }));
+    expect(() => normalizeResyncRequest({ requestId: 'UPPER CASE' }))
+      .toThrow(expect.objectContaining({
+        code: 'INVALID_VERIFICATION_RESYNC_REQUEST_ID',
+        status: 400,
+      }));
+  });
+
+  test('loads a positive verification epoch and fails closed on bad configuration', () => {
+    expect(verificationEpoch({ VERIFY_EPOCH: '3' })).toBe(3);
+    expect(verificationEpoch({})).toBe(1);
+    expect(() => verificationEpoch({ VERIFY_EPOCH: '0' }))
+      .toThrow(expect.objectContaining({ code: 'VERIFY_CONFIGURATION_INVALID' }));
   });
 
   test('enforces SuperAdmin recovery authorization inside the service boundary', () => {

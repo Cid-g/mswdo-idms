@@ -2,13 +2,22 @@
 
 const mongoose = require('mongoose');
 
+const Applicant = require('../models/Applicant');
 const AuditLog = require('../models/AuditLog');
+const BlockchainAnchor = require('../models/BlockchainAnchor');
+const IDRecord = require('../models/IDRecord');
 const VerifyOutbox = require('../models/VerifyOutbox');
 const { withMongoTransaction } = require('../lib/transactions');
+const { buildVerificationPayload } = require('./verificationProjection');
+const {
+  enqueueVerificationSync,
+  verificationOperationIdFor,
+} = require('./verifyOutbox');
 
 const DEFAULT_STATUS_ROW_LIMIT = 25;
 const OPERATION_ID_PATTERN = /^verify:([a-z][a-z0-9_]{0,31}):([a-f0-9]{24})(?::[A-Za-z0-9._-]{1,96})?$/i;
 const OPERATION_REF_PATTERN = /^[a-f0-9]{24}$/i;
+const RESYNC_REQUEST_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{7,63}$/;
 const ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 class VerificationOutboxOperationError extends Error {
@@ -41,6 +50,54 @@ function normalizeOperationRef(value) {
     );
   }
   return new mongoose.Types.ObjectId(value).toString();
+}
+
+function normalizeIdRecordRef(value) {
+  if (typeof value !== 'string' || !OPERATION_REF_PATTERN.test(value)) {
+    throw new VerificationOutboxOperationError(
+      400,
+      'INVALID_ID_RECORD_REF',
+      'ID record reference must be a 24-character hexadecimal identifier.'
+    );
+  }
+  return new mongoose.Types.ObjectId(value).toString();
+}
+
+function normalizeResyncRequest(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw new VerificationOutboxOperationError(
+      400,
+      'INVALID_VERIFICATION_RESYNC_REQUEST',
+      'Verification resynchronization request must be a JSON object.'
+    );
+  }
+  const fields = Object.keys(body).sort();
+  if (fields.length !== 1 || fields[0] !== 'requestId') {
+    throw new VerificationOutboxOperationError(
+      400,
+      'INVALID_VERIFICATION_RESYNC_REQUEST',
+      'Verification resynchronization request must contain only requestId.'
+    );
+  }
+  if (typeof body.requestId !== 'string' || !RESYNC_REQUEST_ID_PATTERN.test(body.requestId)) {
+    throw new VerificationOutboxOperationError(
+      400,
+      'INVALID_VERIFICATION_RESYNC_REQUEST_ID',
+      'requestId must be 8 to 64 lowercase letters, numbers, dots, underscores, or hyphens.'
+    );
+  }
+  return Object.freeze({ requestId: body.requestId });
+}
+
+function verificationEpoch(env = process.env) {
+  const raw = env.VERIFY_EPOCH ?? '1';
+  const epoch = Number(raw);
+  if (!Number.isSafeInteger(epoch) || epoch < 1) {
+    const error = new Error('VERIFY_EPOCH must be a positive safe integer.');
+    error.code = 'VERIFY_CONFIGURATION_INVALID';
+    throw error;
+  }
+  return epoch;
 }
 
 function requireSuperadminActor(actor) {
@@ -307,15 +364,172 @@ async function retryFailedVerificationOperation({
   });
 }
 
+function mapResyncEnqueueError(error) {
+  if (error?.code === 'VERIFY_OPERATION_ID_COLLISION') {
+    return new VerificationOutboxOperationError(
+      409,
+      'VERIFICATION_RESYNC_REQUEST_CONFLICT',
+      'requestId was already used for a different verification projection.'
+    );
+  }
+  if (error?.code === 'VERIFY_ID_RECORD_NOT_FOUND') {
+    return new VerificationOutboxOperationError(
+      404,
+      'ID_RECORD_NOT_FOUND',
+      'ID record was not found.'
+    );
+  }
+  return error;
+}
+
+function buildCurrentResyncProjection({ applicant, idRecord, anchor }) {
+  try {
+    return buildVerificationPayload({ applicant, idRecord, anchor });
+  } catch (error) {
+    if (error?.name !== 'VerificationPayloadValidationError' && !(error instanceof TypeError)) {
+      throw error;
+    }
+    throw new VerificationOutboxOperationError(
+      409,
+      'VERIFICATION_RESYNC_SOURCE_INVALID',
+      'Current local record cannot produce a valid verification projection.'
+    );
+  }
+}
+
+async function queueFullRecordResynchronization({
+  idRecordRef,
+  request,
+  actor,
+  now = new Date(),
+  epoch = verificationEpoch(),
+}) {
+  const normalizedRecordRef = normalizeIdRecordRef(idRecordRef);
+  const normalizedRequest = normalizeResyncRequest(request);
+  const normalizedActor = requireSuperadminActor(actor);
+  requireDate(now, 'now');
+  if (!Number.isSafeInteger(epoch) || epoch < 1) {
+    throw new TypeError('Verification resynchronization epoch must be a positive safe integer.');
+  }
+
+  const operationId = verificationOperationIdFor(
+    'RESYNC',
+    normalizedRecordRef,
+    normalizedRequest.requestId
+  );
+
+  return withMongoTransaction(async (session) => {
+    const idRecord = await IDRecord.findById(normalizedRecordRef).session(session);
+    if (!idRecord) {
+      throw new VerificationOutboxOperationError(
+        404,
+        'ID_RECORD_NOT_FOUND',
+        'ID record was not found.'
+      );
+    }
+
+    const [applicant, anchor, existingOperation, latestHistory] = await Promise.all([
+      Applicant.findById(idRecord.applicantId).session(session),
+      BlockchainAnchor.findOne({ idRecordId: idRecord._id }).session(session),
+      VerifyOutbox.findOne({ operationId }).session(session),
+      VerifyOutbox.findOne({ idRecordId: idRecord._id })
+        .sort({ revision: -1, epoch: -1, _id: -1 })
+        .session(session),
+    ]);
+
+    if (!applicant) {
+      throw new VerificationOutboxOperationError(
+        409,
+        'VERIFICATION_RESYNC_SOURCE_INCOMPLETE',
+        'The ID record no longer has its required local applicant source.'
+      );
+    }
+    if (!latestHistory) {
+      throw new VerificationOutboxOperationError(
+        409,
+        'VERIFICATION_RESYNC_HISTORY_REQUIRED',
+        'Full-record resynchronization requires existing verification history.'
+      );
+    }
+    if (idRecord.verifyRevision !== latestHistory.revision) {
+      throw new VerificationOutboxOperationError(
+        409,
+        'VERIFICATION_RESYNC_HISTORY_INCONSISTENT',
+        'Local verification revision does not match the latest durable outbox revision.'
+      );
+    }
+
+    const otherUndelivered = await VerifyOutbox.findOne({
+      idRecordId: idRecord._id,
+      state: { $ne: 'SENT' },
+      ...(existingOperation ? { _id: { $ne: existingOperation._id } } : {}),
+    }).session(session);
+    if (otherUndelivered) {
+      throw new VerificationOutboxOperationError(
+        409,
+        'VERIFICATION_RESYNC_BLOCKED_BY_UNDELIVERED',
+        'Resolve existing undelivered verification work before requesting a full-record resynchronization.'
+      );
+    }
+
+    const projection = buildCurrentResyncProjection({ applicant, idRecord, anchor });
+    const previousRevision = idRecord.verifyRevision;
+    let queued;
+    try {
+      queued = await enqueueVerificationSync({
+        session,
+        operationId,
+        idRecordId: idRecord._id,
+        payload: projection,
+        epoch,
+      });
+    } catch (error) {
+      throw mapResyncEnqueueError(error);
+    }
+
+    const created = !existingOperation;
+    if (created) {
+      await AuditLog.create([{
+        userId: normalizedActor.id,
+        action: 'VERIFICATION_SYNC_RESYNC_QUEUED',
+        department: normalizedActor.department,
+        targetType: 'IDRecord',
+        targetId: idRecord._id.toString(),
+        description: `Authoritative verification resynchronization queued as revision ${queued.revision}.`,
+        metadata: {
+          operationRef: queued._id.toString(),
+          event: 'RESYNC',
+          requestId: normalizedRequest.requestId,
+          epoch: queued.epoch,
+          revision: queued.revision,
+          previousRevision,
+          sourceStatus: idRecord.status,
+          anchorIncluded: projection.txId !== null,
+        },
+      }], { session });
+    }
+
+    return Object.freeze({
+      queued: created,
+      idempotent: !created,
+      operation: serializeVerificationOperation(queued, { now }),
+    });
+  });
+}
+
 module.exports = {
   DEFAULT_STATUS_ROW_LIMIT,
   VerificationOutboxOperationError,
   buildVerificationSyncStatus,
+  normalizeIdRecordRef,
   normalizeOperationRef,
+  normalizeResyncRequest,
   operationEvent,
+  queueFullRecordResynchronization,
   requireSuperadminActor,
   retryFailedVerificationOperation,
   safeFailureClassification,
   serializeVerificationOperation,
   staleProcessingQuery,
+  verificationEpoch,
 };
