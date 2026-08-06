@@ -1,7 +1,7 @@
 import { useNavigate, useLocation } from 'react-router-dom';
 import {
   LayoutDashboard, Users, FileText, ClipboardList,
-  LogOut, Settings, Printer, FileBarChart, ShieldCheck,
+  LogOut, Settings, Printer, FileBarChart, ShieldCheck, CloudCog,
 } from 'lucide-react';
 import useAuthStore from '../../stores/authStore';
 import api from '../../services/api';
@@ -40,6 +40,7 @@ function getNavSections(role) {
       { icon: Users,         label: 'Manage Admins', path: '/superadmin/users' },
       { icon: ClipboardList, label: 'Activity History', path: '/superadmin/audit-logs' },
       { icon: ShieldCheck,   label: 'Blockchain', path: '/superadmin/blockchain' },
+      { icon: CloudCog,      label: 'Verification Sync', path: '/superadmin/verification-sync' },
     ]},
   ];
   if (role === 'ADMIN') return [

@@ -13,6 +13,7 @@ import SuperAdminDashboard  from './pages/superadmin/DashboardPage';
 import ManageAdminsPage     from './pages/superadmin/ManageAdminsPage';
 import SuperAdminAuditLogs  from './pages/superadmin/AuditLogsPage';
 import BlockchainPage       from './pages/superadmin/BlockchainPage';
+import VerificationSyncPage from './pages/superadmin/VerificationSyncPage';
 
 // Admin pages
 import AdminDashboard       from './pages/admin/DashboardPage';
@@ -67,7 +68,8 @@ export default function App() {
                   <Route path="dashboard"  element={<SuperAdminDashboard />} />
                   <Route path="users"      element={<ManageAdminsPage />} />
                   <Route path="audit-logs" element={<SuperAdminAuditLogs />} />
-                  <Route path="blockchain" element={<BlockchainPage />} />
+                  <Route path="blockchain"        element={<BlockchainPage />} />
+                  <Route path="verification-sync" element={<VerificationSyncPage />} />
                   <Route path="settings"  element={<AccountSettingsPage />} />
                   <Route path="*" element={<Navigate to="/superadmin/dashboard" replace />} />
                 </Routes>
