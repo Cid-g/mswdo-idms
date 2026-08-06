@@ -2,6 +2,7 @@
 
 const {
   buildVerificationSyncStatus,
+  retryFailedVerificationOperation,
 } = require('../services/verificationOutboxOperations');
 
 async function getVerificationSyncStatus(_req, res, next) {
@@ -13,4 +14,19 @@ async function getVerificationSyncStatus(_req, res, next) {
   }
 }
 
-module.exports = { getVerificationSyncStatus };
+async function retryVerificationSyncOperation(req, res, next) {
+  try {
+    const result = await retryFailedVerificationOperation({
+      operationRef: req.params.operationRef,
+      actor: req.user,
+    });
+    return res.json(result);
+  } catch (error) {
+    next(error);
+  }
+}
+
+module.exports = {
+  getVerificationSyncStatus,
+  retryVerificationSyncOperation,
+};

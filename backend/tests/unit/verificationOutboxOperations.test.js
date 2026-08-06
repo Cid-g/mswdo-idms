@@ -3,7 +3,9 @@
 const mongoose = require('mongoose');
 
 const {
+  normalizeOperationRef,
   operationEvent,
+  requireSuperadminActor,
   safeFailureClassification,
   serializeVerificationOperation,
   staleProcessingQuery,
@@ -34,6 +36,33 @@ function operation(overrides = {}) {
 }
 
 describe('verification outbox operations helpers', () => {
+
+  test('normalizes only opaque Mongo operation references', () => {
+    expect(normalizeOperationRef('64B7F1F77BCF86CD79943901'))
+      .toBe('64b7f1f77bcf86cd79943901');
+    expect(() => normalizeOperationRef('verify:issue:507f1f77bcf86cd799439011'))
+      .toThrow(expect.objectContaining({
+        code: 'INVALID_VERIFICATION_OPERATION_REF',
+        status: 400,
+      }));
+  });
+
+  test('enforces SuperAdmin recovery authorization inside the service boundary', () => {
+    expect(requireSuperadminActor({
+      id: '507f1f77bcf86cd799439011',
+      role: 'SUPERADMIN',
+      department: null,
+    })).toEqual({
+      id: new mongoose.Types.ObjectId('507f1f77bcf86cd799439011'),
+      department: null,
+    });
+    expect(() => requireSuperadminActor({
+      id: '507f1f77bcf86cd799439011',
+      role: 'ADMIN',
+      department: 'PWD',
+    })).toThrow(expect.objectContaining({ code: 'FORBIDDEN', status: 403 }));
+  });
+
   test('extracts only the normalized operation event from canonical IDs', () => {
     expect(operationEvent('verify:issue:507f1f77bcf86cd799439011')).toBe('ISSUE');
     expect(operationEvent('verify:anchor_receipt:507f1f77bcf86cd799439011:tx-1')).toBe('ANCHOR_RECEIPT');

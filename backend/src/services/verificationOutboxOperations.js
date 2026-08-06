@@ -1,10 +1,24 @@
 'use strict';
 
+const mongoose = require('mongoose');
+
+const AuditLog = require('../models/AuditLog');
 const VerifyOutbox = require('../models/VerifyOutbox');
+const { withMongoTransaction } = require('../lib/transactions');
 
 const DEFAULT_STATUS_ROW_LIMIT = 25;
 const OPERATION_ID_PATTERN = /^verify:([a-z][a-z0-9_]{0,31}):([a-f0-9]{24})(?::[A-Za-z0-9._-]{1,96})?$/i;
+const OPERATION_REF_PATTERN = /^[a-f0-9]{24}$/i;
 const ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
+
+class VerificationOutboxOperationError extends Error {
+  constructor(status, code, message) {
+    super(message);
+    this.name = 'VerificationOutboxOperationError';
+    this.status = status;
+    this.code = code;
+  }
+}
 
 function requireDate(value, name) {
   if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
@@ -16,6 +30,37 @@ function requireLimit(value) {
   if (!Number.isSafeInteger(value) || value < 1 || value > 100) {
     throw new TypeError('Verification status row limit must be between 1 and 100.');
   }
+}
+
+function normalizeOperationRef(value) {
+  if (typeof value !== 'string' || !OPERATION_REF_PATTERN.test(value)) {
+    throw new VerificationOutboxOperationError(
+      400,
+      'INVALID_VERIFICATION_OPERATION_REF',
+      'Verification operation reference must be a 24-character hexadecimal identifier.'
+    );
+  }
+  return new mongoose.Types.ObjectId(value).toString();
+}
+
+function requireSuperadminActor(actor) {
+  if (!actor || typeof actor !== 'object') {
+    throw new TypeError('Authenticated verification operations actor is required.');
+  }
+  if (actor.role !== 'SUPERADMIN') {
+    throw new VerificationOutboxOperationError(
+      403,
+      'FORBIDDEN',
+      'Verification synchronization recovery is restricted to SUPERADMIN.'
+    );
+  }
+  if (typeof actor.id !== 'string' || !OPERATION_REF_PATTERN.test(actor.id)) {
+    throw new TypeError('Authenticated verification operations actor ID is invalid.');
+  }
+  return Object.freeze({
+    id: new mongoose.Types.ObjectId(actor.id),
+    department: typeof actor.department === 'string' ? actor.department : null,
+  });
 }
 
 function operationEvent(operationId) {
@@ -185,10 +230,91 @@ async function buildVerificationSyncStatus({
   });
 }
 
+async function retryFailedVerificationOperation({
+  operationRef,
+  actor,
+  now = new Date(),
+}) {
+  const normalizedRef = normalizeOperationRef(operationRef);
+  const normalizedActor = requireSuperadminActor(actor);
+  requireDate(now, 'now');
+
+  return withMongoTransaction(async (session) => {
+    const operation = await VerifyOutbox.findById(normalizedRef).session(session);
+    if (!operation) {
+      throw new VerificationOutboxOperationError(
+        404,
+        'VERIFICATION_OPERATION_NOT_FOUND',
+        'Verification synchronization operation was not found.'
+      );
+    }
+    if (operation.state !== 'FAILED') {
+      throw new VerificationOutboxOperationError(
+        409,
+        'VERIFICATION_OPERATION_NOT_RETRYABLE',
+        `Only FAILED verification synchronization operations can be retried; current state is ${operation.state}.`
+      );
+    }
+
+    const event = operationEvent(operation.operationId);
+    const failure = safeFailureClassification(operation.lastError, { required: true });
+    const previousAttempts = operation.attempts;
+    const updated = await VerifyOutbox.findOneAndUpdate(
+      { _id: operation._id, state: 'FAILED' },
+      {
+        $set: {
+          state: 'PENDING',
+          nextAttempt: now,
+        },
+        $unset: {
+          lastError: '',
+          lockOwner: '',
+          lockedUntil: '',
+        },
+      },
+      { new: true, session }
+    );
+    if (!updated) {
+      throw new VerificationOutboxOperationError(
+        409,
+        'VERIFICATION_OPERATION_STATE_CHANGED',
+        'Verification synchronization operation changed while retry was being prepared.'
+      );
+    }
+
+    await AuditLog.create([{
+      userId: normalizedActor.id,
+      action: 'VERIFICATION_SYNC_RETRY_QUEUED',
+      department: normalizedActor.department,
+      targetType: 'VerifyOutbox',
+      targetId: operation._id.toString(),
+      description: `Verification synchronization retry queued for ${event} revision ${operation.revision}.`,
+      metadata: {
+        operationRef: operation._id.toString(),
+        event,
+        epoch: operation.epoch,
+        revision: operation.revision,
+        previousState: 'FAILED',
+        previousAttempts,
+        failure,
+      },
+    }], { session });
+
+    return Object.freeze({
+      retried: true,
+      operation: serializeVerificationOperation(updated, { now }),
+    });
+  });
+}
+
 module.exports = {
   DEFAULT_STATUS_ROW_LIMIT,
+  VerificationOutboxOperationError,
   buildVerificationSyncStatus,
+  normalizeOperationRef,
   operationEvent,
+  requireSuperadminActor,
+  retryFailedVerificationOperation,
   safeFailureClassification,
   serializeVerificationOperation,
   staleProcessingQuery,
