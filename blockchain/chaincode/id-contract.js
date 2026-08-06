@@ -2,11 +2,69 @@
 
 const { Contract } = require('fabric-contract-api');
 
-function transactionTime(ctx) {
-  const timestamp = ctx.stub.getTxTimestamp();
-  const seconds = BigInt(timestamp.seconds.toString());
-  const millis = seconds * 1000n + BigInt(Math.floor(timestamp.nanos / 1_000_000));
+const MAX_DATE_MILLIS = 8640000000000000n;
+
+function integerToBigInt(value, label) {
+  if (typeof value === 'bigint') return value;
+
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value)) {
+      throw new Error(`Invalid ${label}`);
+    }
+    return BigInt(value);
+  }
+
+  if (typeof value === 'string') {
+    if (!/^-?\d+$/.test(value)) {
+      throw new Error(`Invalid ${label}`);
+    }
+    return BigInt(value);
+  }
+
+  if (value && typeof value.toString === 'function') {
+    const decimal = value.toString();
+    if (/^-?\d+$/.test(decimal)) {
+      return BigInt(decimal);
+    }
+  }
+
+  if (value && Number.isInteger(value.low)
+      && (value.high === undefined || Number.isInteger(value.high))) {
+    const low = BigInt(value.low >>> 0);
+    const highValue = value.high ?? 0;
+    const high = BigInt(highValue >>> 0);
+    let result = (high << 32n) | low;
+
+    if (!value.unsigned && (highValue & 0x80000000) !== 0) {
+      result -= 1n << 64n;
+    }
+
+    return result;
+  }
+
+  throw new Error(`Invalid ${label}`);
+}
+
+function timestampToISOString(timestamp) {
+  if (!timestamp) throw new Error('Invalid Fabric timestamp');
+
+  const seconds = integerToBigInt(timestamp.seconds, 'Fabric timestamp seconds');
+  const nanos = integerToBigInt(timestamp.nanos ?? 0, 'Fabric timestamp nanos');
+
+  if (nanos < 0n || nanos >= 1000000000n) {
+    throw new Error('Invalid Fabric timestamp nanos');
+  }
+
+  const millis = seconds * 1000n + nanos / 1000000n;
+  if (millis < -MAX_DATE_MILLIS || millis > MAX_DATE_MILLIS) {
+    throw new Error('Fabric timestamp is outside the supported date range');
+  }
+
   return new Date(Number(millis)).toISOString();
+}
+
+function transactionTime(ctx) {
+  return timestampToISOString(ctx.stub.getTxTimestamp());
 }
 
 class IDContract extends Contract {
@@ -62,20 +120,23 @@ class IDContract extends Contract {
 
   async getIDHistory(ctx, recordRef) {
     const iterator = await ctx.stub.getHistoryForKey(recordRef);
-    const history = [];
-    let result = await iterator.next();
-    while (!result.done) {
-      const { txId, timestamp, isDelete, value } = result.value;
-      history.push({
-        txId,
-        timestamp: new Date(timestamp.seconds.low * 1000).toISOString(),
-        isDelete,
-        record: value ? JSON.parse(value.toString()) : null,
-      });
-      result = await iterator.next();
+    try {
+      const history = [];
+      let result = await iterator.next();
+      while (!result.done) {
+        const { txId, timestamp, isDelete, value } = result.value;
+        history.push({
+          txId,
+          timestamp: timestampToISOString(timestamp),
+          isDelete,
+          record: value && value.length > 0 ? JSON.parse(value.toString()) : null,
+        });
+        result = await iterator.next();
+      }
+      return JSON.stringify(history);
+    } finally {
+      await iterator.close();
     }
-    await iterator.close();
-    return JSON.stringify(history);
   }
 
   async expireID(ctx, recordRef) {

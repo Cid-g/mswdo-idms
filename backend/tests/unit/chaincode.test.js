@@ -36,6 +36,19 @@ function makeMockCtx() {
   return { stub, _store: store, _events: events };
 }
 
+function makeHistoryIterator(entries) {
+  let index = 0;
+  return {
+    next: jest.fn(async () => {
+      if (index >= entries.length) return { done: true };
+      const value = entries[index];
+      index += 1;
+      return { done: false, value };
+    }),
+    close: jest.fn(async () => {}),
+  };
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('IDContract — issueID', () => {
@@ -148,38 +161,114 @@ describe('IDContract — expireID', () => {
   });
 });
 
-describe('IDContract — getIDHistory', () => {
+describe('IDContract â€” getIDHistory', () => {
   let contract;
 
   beforeEach(() => { contract = new IDContract(); });
 
   test('returns empty array when no history exists', async () => {
     const ctx = makeMockCtx();
+    const iterator = makeHistoryIterator([]);
+    ctx.stub.getHistoryForKey.mockResolvedValue(iterator);
+
     const result = JSON.parse(await contract.getIDHistory(ctx, 'PWD-2026-0001'));
+
     expect(Array.isArray(result)).toBe(true);
     expect(result).toHaveLength(0);
+    expect(iterator.close).toHaveBeenCalledTimes(1);
   });
 
-  test('maps iterator entries into history objects', async () => {
+  test('maps a Fabric Long-like timestamp and preserves milliseconds', async () => {
     const ctx = makeMockCtx();
     const fakeEntry = {
-      txId:     'tx-abc123',
-      timestamp: { seconds: { low: 1716000000 } },
+      txId: 'tx-abc123',
+      timestamp: {
+        seconds: { toString: () => '1786038158' },
+        nanos: 468999999,
+      },
       isDelete: false,
-      value:    Buffer.from(JSON.stringify({ status: 'ACTIVE' })),
+      value: Buffer.from(JSON.stringify({ status: 'ACTIVE' })),
     };
-    let called = false;
-    ctx.stub.getHistoryForKey = jest.fn(async () => ({
-      next: jest.fn(async () => {
-        if (!called) { called = true; return { done: false, value: fakeEntry }; }
-        return { done: true };
-      }),
-      close: jest.fn(async () => {}),
-    }));
+    const iterator = makeHistoryIterator([fakeEntry]);
+    ctx.stub.getHistoryForKey.mockResolvedValue(iterator);
 
     const result = JSON.parse(await contract.getIDHistory(ctx, 'PWD-2026-0001'));
+
     expect(result).toHaveLength(1);
     expect(result[0].txId).toBe('tx-abc123');
+    expect(result[0].timestamp).toBe('2026-08-06T17:42:38.468Z');
+    expect(result[0].isDelete).toBe(false);
     expect(result[0].record.status).toBe('ACTIVE');
+    expect(iterator.close).toHaveBeenCalledTimes(1);
+  });
+
+  test('supports the legacy low/high protobuf integer shape', async () => {
+    const ctx = makeMockCtx();
+    const iterator = makeHistoryIterator([{
+      txId: 'tx-low-high',
+      timestamp: {
+        seconds: { low: 1716000000, high: 0, unsigned: false },
+        nanos: 0,
+      },
+      isDelete: false,
+      value: Buffer.from(JSON.stringify({ status: 'ACTIVE' })),
+    }]);
+    ctx.stub.getHistoryForKey.mockResolvedValue(iterator);
+
+    const result = JSON.parse(await contract.getIDHistory(ctx, 'PWD-2026-0001'));
+
+    expect(result[0].timestamp).toBe('2024-05-18T02:40:00.000Z');
+    expect(iterator.close).toHaveBeenCalledTimes(1);
+  });
+
+  test('returns null record for a delete history entry', async () => {
+    const ctx = makeMockCtx();
+    const iterator = makeHistoryIterator([{
+      txId: 'tx-delete',
+      timestamp: { seconds: '1786038158', nanos: 0 },
+      isDelete: true,
+      value: Buffer.alloc(0),
+    }]);
+    ctx.stub.getHistoryForKey.mockResolvedValue(iterator);
+
+    const result = JSON.parse(await contract.getIDHistory(ctx, 'PWD-2026-0001'));
+
+    expect(result[0].record).toBeNull();
+    expect(result[0].isDelete).toBe(true);
+    expect(iterator.close).toHaveBeenCalledTimes(1);
+  });
+
+  test('rejects malformed timestamps and still closes the iterator', async () => {
+    const ctx = makeMockCtx();
+    const iterator = makeHistoryIterator([{
+      txId: 'tx-invalid-time',
+      timestamp: { seconds: 'not-an-integer', nanos: 0 },
+      isDelete: false,
+      value: Buffer.from(JSON.stringify({ status: 'ACTIVE' })),
+    }]);
+    ctx.stub.getHistoryForKey.mockResolvedValue(iterator);
+
+    await expect(
+      contract.getIDHistory(ctx, 'PWD-2026-0001')
+    ).rejects.toThrow('Invalid Fabric timestamp seconds');
+
+    expect(iterator.close).toHaveBeenCalledTimes(1);
+  });
+
+  test('closes the iterator when history record parsing fails', async () => {
+    const ctx = makeMockCtx();
+    const iterator = makeHistoryIterator([{
+      txId: 'tx-invalid-json',
+      timestamp: { seconds: 1786038158n, nanos: 0 },
+      isDelete: false,
+      value: Buffer.from('{invalid-json'),
+    }]);
+    ctx.stub.getHistoryForKey.mockResolvedValue(iterator);
+
+    await expect(
+      contract.getIDHistory(ctx, 'PWD-2026-0001')
+    ).rejects.toThrow();
+
+    expect(iterator.close).toHaveBeenCalledTimes(1);
   });
 });
