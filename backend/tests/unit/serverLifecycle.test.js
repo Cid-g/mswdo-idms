@@ -3,13 +3,18 @@
 const { EventEmitter } = require('node:events');
 
 const {
+  DEFAULT_VERIFICATION_WORKER_INTERVAL_MS,
   createServerLifecycle,
+  loadVerificationWorkerConfig,
   registerSignalHandlers,
 } = require('../../src/server');
 const {
   startExpiryJob,
   stopExpiryJob,
 } = require('../../src/jobs/expiryJob');
+const {
+  stopVerificationOutboxWorker,
+} = require('../../src/workers/verificationOutboxWorker');
 
 function deferred() {
   let resolve;
@@ -84,6 +89,15 @@ function lifecycleFixture(overrides = {}) {
     expiryStopper: jest.fn(async () => {
       events.push('expiry:stop');
     }),
+    environment: { NODE_ENV: 'test', VERIFICATION_SYNC_ENABLED: 'false' },
+    verificationConfigLoader: jest.fn(() => ({ enabled: false })),
+    verificationClientFactory: jest.fn(),
+    verificationWorkerStarter: jest.fn(() => {
+      events.push('verification:start');
+    }),
+    verificationWorkerStopper: jest.fn(async () => {
+      events.push('verification:stop');
+    }),
     logger,
     ...overrides,
   });
@@ -99,8 +113,76 @@ function lifecycleFixture(overrides = {}) {
 
 describe('production server lifecycle', () => {
   afterEach(async () => {
-    await stopExpiryJob();
+    await Promise.all([
+      stopExpiryJob(),
+      stopVerificationOutboxWorker(),
+    ]);
     jest.useRealTimers();
+  });
+
+
+
+  test('verification sync defaults off outside production and requires an explicit production choice', () => {
+    expect(loadVerificationWorkerConfig({ NODE_ENV: 'test' }))
+      .toEqual({ enabled: false });
+
+    let productionError;
+    try {
+      loadVerificationWorkerConfig({ NODE_ENV: 'production' });
+    } catch (error) {
+      productionError = error;
+    }
+    expect(productionError).toMatchObject({
+      code: 'VERIFICATION_SYNC_ENABLEMENT_REQUIRED',
+    });
+  });
+
+  test('verification sync false does not load key material or client configuration', () => {
+    const syncConfigLoader = jest.fn();
+
+    expect(loadVerificationWorkerConfig({
+      NODE_ENV: 'production',
+      VERIFICATION_SYNC_ENABLED: 'false',
+    }, { syncConfigLoader })).toEqual({ enabled: false });
+    expect(syncConfigLoader).not.toHaveBeenCalled();
+  });
+
+  test('verification sync true loads the signed client configuration and worker cadence', () => {
+    const clientConfig = Object.freeze({ keyId: 'office-key-1' });
+    const syncConfigLoader = jest.fn(() => clientConfig);
+
+    expect(loadVerificationWorkerConfig({
+      NODE_ENV: 'production',
+      VERIFICATION_SYNC_ENABLED: 'true',
+      VERIFICATION_SYNC_WORKER_INTERVAL_MS: '45000',
+    }, { syncConfigLoader })).toEqual({
+      clientConfig,
+      enabled: true,
+      intervalMs: 45_000,
+    });
+    expect(syncConfigLoader).toHaveBeenCalledTimes(1);
+  });
+
+  test('verification sync rejects ambiguous enablement and unsafe worker intervals', () => {
+    expect(() => loadVerificationWorkerConfig({
+      NODE_ENV: 'production',
+      VERIFICATION_SYNC_ENABLED: 'TRUE',
+    })).toThrow('exactly true or false');
+
+    const syncConfigLoader = jest.fn(() => ({ keyId: 'office-key-1' }));
+    for (const interval of ['999', '3600001', '1.5', 'not-a-number']) {
+      expect(() => loadVerificationWorkerConfig({
+        NODE_ENV: 'production',
+        VERIFICATION_SYNC_ENABLED: 'true',
+        VERIFICATION_SYNC_WORKER_INTERVAL_MS: interval,
+      }, { syncConfigLoader })).toThrow('VERIFICATION_SYNC_WORKER_INTERVAL_MS');
+    }
+
+    expect(loadVerificationWorkerConfig({
+      NODE_ENV: 'production',
+      VERIFICATION_SYNC_ENABLED: 'true',
+    }, { syncConfigLoader }).intervalMs)
+      .toBe(DEFAULT_VERIFICATION_WORKER_INTERVAL_MS);
   });
 
   test('importing app.js starts no background timers', () => {
@@ -133,6 +215,7 @@ describe('production server lifecycle', () => {
       outboxStopper: jest.fn(async () => events.push('outbox:stop')),
       expiryStarter: jest.fn(() => events.push('expiry:start')),
       expiryStopper: jest.fn(async () => events.push('expiry:stop')),
+      verificationConfigLoader: jest.fn(() => ({ enabled: false })),
       logger: { error: jest.fn(), log: jest.fn(), warn: jest.fn() },
     });
 
@@ -152,6 +235,82 @@ describe('production server lifecycle', () => {
     await Promise.resolve();
     await Promise.resolve();
     await lifecycle.shutdown();
+  });
+
+
+  test('validates verification configuration before Mongo and starts the sender after migrations', async () => {
+    const events = [];
+    const { app } = fakeHttpApp(events);
+    const clientConfig = { keyId: 'office-key-1' };
+    const syncClient = { sendRecord: jest.fn() };
+    const lifecycle = createServerLifecycle({
+      appInstance: app,
+      mongooseClient: {
+        connect: jest.fn(async () => events.push('mongo:connect')),
+        disconnect: jest.fn(async () => events.push('mongo:disconnect')),
+      },
+      migrationRunner: jest.fn(async () => events.push('migrations')),
+      fabricConnector: jest.fn(() => {
+        events.push('fabric:attempt');
+        return Promise.resolve({ available: false, reason: 'DISABLED' });
+      }),
+      fabricDisconnector: jest.fn(() => events.push('fabric:disconnect')),
+      outboxStarter: jest.fn(() => events.push('outbox:start')),
+      outboxStopper: jest.fn(async () => events.push('outbox:stop')),
+      expiryStarter: jest.fn(() => events.push('expiry:start')),
+      expiryStopper: jest.fn(async () => events.push('expiry:stop')),
+      environment: { NODE_ENV: 'production', VERIFICATION_SYNC_ENABLED: 'true' },
+      verificationConfigLoader: jest.fn(() => {
+        events.push('verification:config');
+        return { clientConfig, enabled: true, intervalMs: 45_000 };
+      }),
+      verificationClientFactory: jest.fn(({ config }) => {
+        events.push('verification:client');
+        expect(config).toBe(clientConfig);
+        return syncClient;
+      }),
+      verificationWorkerStarter: jest.fn((options) => {
+        events.push('verification:start');
+        expect(options).toEqual({ intervalMs: 45_000, syncClient });
+      }),
+      verificationWorkerStopper: jest.fn(async () => events.push('verification:stop')),
+      logger: { error: jest.fn(), log: jest.fn(), warn: jest.fn() },
+    });
+
+    await lifecycle.start();
+
+    expect(events.slice(0, 9)).toEqual([
+      'verification:config',
+      'verification:client',
+      'mongo:connect',
+      'migrations',
+      'fabric:attempt',
+      'outbox:start',
+      'expiry:start',
+      'verification:start',
+      'http:listen',
+    ]);
+    await lifecycle.shutdown();
+  });
+
+  test('invalid verification configuration fails before MongoDB and all workers', async () => {
+    const { lifecycle, events, mongooseClient } = lifecycleFixture({
+      verificationConfigLoader: jest.fn(() => {
+        const error = new Error('invalid verification configuration');
+        error.code = 'INVALID_VERIFICATION_SYNC_CONFIG';
+        throw error;
+      }),
+    });
+
+    await expect(lifecycle.start()).rejects.toMatchObject({
+      code: 'INVALID_VERIFICATION_SYNC_CONFIG',
+    });
+
+    expect(mongooseClient.connect).not.toHaveBeenCalled();
+    expect(events).not.toContain('outbox:start');
+    expect(events).not.toContain('expiry:start');
+    expect(events).not.toContain('verification:start');
+    expect(events).not.toContain('http:listen');
   });
 
   test('a rejected initial Fabric connection does not block HTTP startup', async () => {
@@ -174,9 +333,10 @@ describe('production server lifecycle', () => {
     await lifecycle.shutdown();
   });
 
-  test('waits for both schedulers before closing HTTP, Fabric, and MongoDB', async () => {
+  test('waits for every scheduler before closing HTTP, Fabric, and MongoDB', async () => {
     const outboxStop = deferred();
     const expiryStop = deferred();
+    const verificationStop = deferred();
     const events = [];
     const { app } = fakeHttpApp(events);
     const lifecycle = createServerLifecycle({
@@ -198,6 +358,18 @@ describe('production server lifecycle', () => {
         events.push('expiry:stop');
         return expiryStop.promise;
       }),
+      environment: { NODE_ENV: 'production', VERIFICATION_SYNC_ENABLED: 'true' },
+      verificationConfigLoader: jest.fn(() => ({
+        clientConfig: { keyId: 'office-key-1' },
+        enabled: true,
+        intervalMs: 30_000,
+      })),
+      verificationClientFactory: jest.fn(() => ({ sendRecord: jest.fn() })),
+      verificationWorkerStarter: jest.fn(() => events.push('verification:start')),
+      verificationWorkerStopper: jest.fn(() => {
+        events.push('verification:stop');
+        return verificationStop.promise;
+      }),
       logger: { error: jest.fn(), log: jest.fn(), warn: jest.fn() },
     });
 
@@ -205,7 +377,11 @@ describe('production server lifecycle', () => {
     const shutdown = lifecycle.shutdown();
     await Promise.resolve();
 
-    expect(events).toEqual(expect.arrayContaining(['outbox:stop', 'expiry:stop']));
+    expect(events).toEqual(expect.arrayContaining([
+      'outbox:stop',
+      'expiry:stop',
+      'verification:stop',
+    ]));
     expect(events).not.toContain('http:close');
 
     outboxStop.resolve();
@@ -213,11 +389,16 @@ describe('production server lifecycle', () => {
     expect(events).not.toContain('http:close');
 
     expiryStop.resolve();
+    await Promise.resolve();
+    expect(events).not.toContain('http:close');
+
+    verificationStop.resolve();
     await shutdown;
 
     const closeIndex = events.indexOf('http:close');
     expect(closeIndex).toBeGreaterThan(events.indexOf('outbox:stop'));
     expect(closeIndex).toBeGreaterThan(events.indexOf('expiry:stop'));
+    expect(closeIndex).toBeGreaterThan(events.indexOf('verification:stop'));
     expect(events.slice(closeIndex)).toEqual([
       'http:close',
       'fabric:disconnect',
@@ -274,6 +455,15 @@ describe('production server lifecycle', () => {
       outboxStopper: jest.fn(async () => events.push('outbox:stop')),
       expiryStarter: jest.fn(() => events.push('expiry:start')),
       expiryStopper: jest.fn(async () => events.push('expiry:stop')),
+      environment: { NODE_ENV: 'production', VERIFICATION_SYNC_ENABLED: 'true' },
+      verificationConfigLoader: jest.fn(() => ({
+        clientConfig: { keyId: 'office-key-1' },
+        enabled: true,
+        intervalMs: 30_000,
+      })),
+      verificationClientFactory: jest.fn(() => ({ sendRecord: jest.fn() })),
+      verificationWorkerStarter: jest.fn(() => events.push('verification:start')),
+      verificationWorkerStopper: jest.fn(async () => events.push('verification:stop')),
       logger: { error: jest.fn(), log: jest.fn(), warn: jest.fn() },
     });
 
@@ -291,6 +481,7 @@ describe('production server lifecycle', () => {
     expect(events).not.toContain('fabric:attempt');
     expect(events).not.toContain('outbox:start');
     expect(events).not.toContain('expiry:start');
+    expect(events).not.toContain('verification:start');
     expect(events).not.toContain('http:listen');
     expect(events.slice(-2)).toEqual(['fabric:disconnect', 'mongo:disconnect']);
   });

@@ -16,9 +16,79 @@ const {
   startExpiryJob,
   stopExpiryJob,
 } = require('./jobs/expiryJob');
+const {
+  VerificationSyncConfigError,
+  createVerificationSyncClient,
+  loadVerificationSyncConfig,
+} = require('./services/verificationSyncClient');
+const {
+  startVerificationOutboxWorker,
+  stopVerificationOutboxWorker,
+} = require('./workers/verificationOutboxWorker');
 
 const PORT = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/mswdo_idms';
+const DEFAULT_VERIFICATION_WORKER_INTERVAL_MS = 30_000;
+const MAX_VERIFICATION_WORKER_INTERVAL_MS = 60 * 60 * 1000;
+
+function verificationConfigError(message, code = 'INVALID_VERIFICATION_SYNC_CONFIG') {
+  return new VerificationSyncConfigError(message, code);
+}
+
+function parseVerificationSyncEnabled(env) {
+  const value = env.VERIFICATION_SYNC_ENABLED;
+  if (value === undefined || value === '') {
+    if (env.NODE_ENV === 'production') {
+      throw verificationConfigError(
+        'VERIFICATION_SYNC_ENABLED must be explicitly set in production.',
+        'VERIFICATION_SYNC_ENABLEMENT_REQUIRED'
+      );
+    }
+    return false;
+  }
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  throw verificationConfigError(
+    'VERIFICATION_SYNC_ENABLED must be exactly true or false.'
+  );
+}
+
+function parseVerificationWorkerInterval(value) {
+  if (value === undefined || value === '') return DEFAULT_VERIFICATION_WORKER_INTERVAL_MS;
+  const parsed = Number(value);
+  if (
+    !Number.isSafeInteger(parsed)
+    || parsed < 1_000
+    || parsed > MAX_VERIFICATION_WORKER_INTERVAL_MS
+  ) {
+    throw verificationConfigError(
+      `VERIFICATION_SYNC_WORKER_INTERVAL_MS must be an integer from 1000 to ${MAX_VERIFICATION_WORKER_INTERVAL_MS}.`
+    );
+  }
+  return parsed;
+}
+
+function loadVerificationWorkerConfig(env = process.env, {
+  syncConfigLoader = loadVerificationSyncConfig,
+} = {}) {
+  if (!env || typeof env !== 'object') {
+    throw new TypeError('Verification worker environment must be an object');
+  }
+  if (typeof syncConfigLoader !== 'function') {
+    throw new TypeError('syncConfigLoader must be a function');
+  }
+
+  const enabled = parseVerificationSyncEnabled(env);
+  if (!enabled) return Object.freeze({ enabled: false });
+
+  return Object.freeze({
+    clientConfig: syncConfigLoader(env),
+    enabled: true,
+    intervalMs: parseVerificationWorkerInterval(
+      env.VERIFICATION_SYNC_WORKER_INTERVAL_MS
+    ),
+  });
+}
 
 async function dropLegacyIndex(model, indexName, logger = console) {
   try {
@@ -62,6 +132,11 @@ function createServerLifecycle({
   outboxStopper = stopChainOutboxWorker,
   expiryStarter = startExpiryJob,
   expiryStopper = stopExpiryJob,
+  environment = process.env,
+  verificationConfigLoader = loadVerificationWorkerConfig,
+  verificationClientFactory = createVerificationSyncClient,
+  verificationWorkerStarter = startVerificationOutboxWorker,
+  verificationWorkerStopper = stopVerificationOutboxWorker,
   logger = console,
 } = {}) {
   let httpServer = null;
@@ -71,6 +146,7 @@ function createServerLifecycle({
   let mongoConnected = false;
   let outboxStarted = false;
   let expiryStarted = false;
+  let verificationWorkerStarted = false;
   let resourcesStopPromise = null;
 
   function attemptFabricConnection() {
@@ -130,9 +206,9 @@ function createServerLifecycle({
         }
       };
 
-      // Both schedulers must be fully idle before the HTTP/Fabric/Mongo layers
-      // are closed. This prevents an in-flight expiry transaction or outbox
-      // settlement from losing its database connection during shutdown.
+      // All schedulers must be fully idle before the HTTP/Fabric/Mongo layers
+      // are closed. This prevents in-flight expiry, Fabric settlement, or
+      // verification delivery from losing its database connection on shutdown.
       await Promise.all([
         capture(async () => {
           if (outboxStarted) await outboxStopper();
@@ -141,6 +217,10 @@ function createServerLifecycle({
         capture(async () => {
           if (expiryStarted) await expiryStopper();
           expiryStarted = false;
+        }),
+        capture(async () => {
+          if (verificationWorkerStarted) await verificationWorkerStopper();
+          verificationWorkerStarted = false;
         }),
       ]);
 
@@ -172,6 +252,14 @@ function createServerLifecycle({
 
     startPromise = (async () => {
       try {
+        // Validate enablement, destination, key material, and worker cadence
+        // before opening MongoDB or any network listener. Production must
+        // explicitly opt in or out; it may never silently omit public sync.
+        const verificationWorkerConfig = verificationConfigLoader(environment);
+        const verificationSyncClient = verificationWorkerConfig.enabled
+          ? verificationClientFactory({ config: verificationWorkerConfig.clientConfig })
+          : null;
+
         await mongooseClient.connect(mongoUri);
         mongoConnected = true;
         assertStartupActive();
@@ -189,6 +277,17 @@ function createServerLifecycle({
 
         expiryStarter();
         expiryStarted = true;
+
+        if (verificationWorkerConfig.enabled) {
+          verificationWorkerStarter({
+            intervalMs: verificationWorkerConfig.intervalMs,
+            syncClient: verificationSyncClient,
+          });
+          verificationWorkerStarted = true;
+          logger.log('[Verification Sync] Outbound sender enabled');
+        } else {
+          logger.log('[Verification Sync] Outbound sender disabled');
+        }
 
         await listen();
         assertStartupActive();
@@ -263,8 +362,11 @@ if (require.main === module) {
 }
 
 module.exports = {
+  DEFAULT_VERIFICATION_WORKER_INTERVAL_MS,
+  MAX_VERIFICATION_WORKER_INTERVAL_MS,
   createServerLifecycle,
   dropLegacyIndex,
+  loadVerificationWorkerConfig,
   registerSignalHandlers,
   runMigrations,
 };
