@@ -40,3 +40,6 @@ build/
 Thumbs.db
 *.log
 *.err
+**/.env
+**/.env.*
+!**/.env.example
