@@ -633,13 +633,21 @@ describe('POST /api/verification-sync/records/:idRecordRef/resync', () => {
       const source = await createResyncSource({ historyState: state });
       const token = await superadminToken();
 
-      const res = await supertest(app)
-        .post(`/api/verification-sync/records/${source.idRecord._id}/resync`)
-        .set('Authorization', `Bearer ${token}`)
-        .send({ requestId: `blocked-${state.toLowerCase()}-request` });
+      const previousNodeEnv = process.env.NODE_ENV;
+      process.env.NODE_ENV = 'development';
+      let res;
+      try {
+        res = await supertest(app)
+          .post(`/api/verification-sync/records/${source.idRecord._id}/resync`)
+          .set('Authorization', `Bearer ${token}`)
+          .send({ requestId: `blocked-${state.toLowerCase()}-request` });
+      } finally {
+        process.env.NODE_ENV = previousNodeEnv;
+      }
 
       expect(res.status).toBe(409);
       expect(res.body.error.code).toBe('VERIFICATION_RESYNC_BLOCKED_BY_UNDELIVERED');
+      expect(res.body.error).not.toHaveProperty('stack');
       expect((await IDRecord.findById(source.idRecord._id).lean()).verifyRevision).toBe(1);
       expect(await VerifyOutbox.countDocuments({ idRecordId: source.idRecord._id })).toBe(1);
       expect(await AuditLog.countDocuments({ action: 'VERIFICATION_SYNC_RESYNC_QUEUED' })).toBe(0);

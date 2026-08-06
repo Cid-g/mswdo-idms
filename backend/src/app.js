@@ -69,7 +69,6 @@ app.use((err, _req, res, _next) => {
     error: {
       code: err.code || 'INTERNAL_ERROR',
       message: err.message || 'An unexpected error occurred.',
-      ...(process.env.NODE_ENV === 'development' && { stack: err.stack }),
     },
   });
 });
