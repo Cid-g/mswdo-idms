@@ -51,6 +51,7 @@ app.use('/api/reports',     require('./routes/reports'));      // Reports tab
 app.use('/api/audit-logs',   require('./routes/auditLogs'));   // Phase 10
 app.use('/api/blockchain',  require('./routes/blockchain'));  // Phase 11
 app.use('/api/verify',      require('./routes/verify'));      // Phase 12
+app.use('/api/verification-sync', require('./routes/verificationSync')); // Phase 2B operations
 
 // ── 404 handler ────────────────────────────────────────────────
 app.use((_req, res) => {
