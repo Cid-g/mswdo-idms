@@ -13,6 +13,20 @@ const {
 const MAX_SIGNED_PAYLOAD_BYTES = 16 * 1024;
 const PROTOCOL_VERSION = 1;
 const SIGNATURE_DOMAIN = 'MSWDO-IDMS/VERIFY-SYNC/V1';
+const HEALTH_SIGNATURE_DOMAIN = 'MSWDO-IDMS/VERIFY-HEALTH/V1';
+const HEALTH_SYNC_FIELDS = Object.freeze([
+  'audience',
+  'domain',
+  'epoch',
+  'keyId',
+  'method',
+  'path',
+  'payload',
+  'payloadDigest',
+  'protocolVersion',
+  'timestamp',
+]);
+const HEALTH_PAYLOAD_FIELDS = Object.freeze(['sourceLastHealthyAt']);
 const RECORD_SYNC_FIELDS = Object.freeze([
   'audience',
   'domain',
@@ -116,6 +130,85 @@ function assertPattern(value, label, pattern) {
   }
 }
 
+function validateHealthPayload(payload, timestamp) {
+  assertPlainObject(payload, 'payload');
+  const keys = Object.keys(payload).sort();
+  const expectedKeys = [...HEALTH_PAYLOAD_FIELDS].sort();
+  if (
+    keys.length !== expectedKeys.length
+    || keys.some((key, index) => key !== expectedKeys[index])
+  ) {
+    throw new VerificationSyncProtocolError(
+      'Health payload fields do not match the protocol schema.'
+    );
+  }
+  assertSafeInteger(payload.sourceLastHealthyAt, 'payload.sourceLastHealthyAt', 1);
+  if (payload.sourceLastHealthyAt !== timestamp) {
+    throw new VerificationSyncProtocolError(
+      'payload.sourceLastHealthyAt must equal the signed request timestamp.',
+      'HEALTH_TIMESTAMP_MISMATCH'
+    );
+  }
+  return payload;
+}
+
+function validateHealthEnvelope(envelope) {
+  assertPlainObject(envelope, 'envelope');
+
+  const keys = Object.keys(envelope).sort();
+  const expectedKeys = [...HEALTH_SYNC_FIELDS].sort();
+  if (
+    keys.length !== expectedKeys.length
+    || keys.some((key, index) => key !== expectedKeys[index])
+  ) {
+    throw new VerificationSyncProtocolError(
+      'Envelope fields do not match the health-sync protocol schema.'
+    );
+  }
+
+  if (envelope.domain !== HEALTH_SIGNATURE_DOMAIN) {
+    throw new VerificationSyncProtocolError('Envelope signature domain is invalid.');
+  }
+  if (envelope.protocolVersion !== PROTOCOL_VERSION) {
+    throw new VerificationSyncProtocolError('Envelope protocol version is unsupported.');
+  }
+
+  assertPattern(envelope.keyId, 'keyId', /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);
+  assertSafeInteger(envelope.epoch, 'epoch', 1);
+  assertSafeInteger(envelope.timestamp, 'timestamp', 1);
+
+  if (envelope.method !== 'POST') {
+    throw new VerificationSyncProtocolError('method must be POST.');
+  }
+  if (
+    typeof envelope.path !== 'string'
+    || !envelope.path.startsWith('/')
+    || envelope.path.includes('?')
+  ) {
+    throw new VerificationSyncProtocolError(
+      'path must be an absolute path without a query string.'
+    );
+  }
+  if (
+    typeof envelope.audience !== 'string'
+    || !envelope.audience.trim()
+    || envelope.audience !== envelope.audience.trim()
+  ) {
+    throw new VerificationSyncProtocolError('audience must be a non-empty string.');
+  }
+
+  validateHealthPayload(envelope.payload, envelope.timestamp);
+  assertPattern(envelope.payloadDigest, 'payloadDigest', /^[a-f0-9]{64}$/);
+  if (digestPayload(envelope.payload) !== envelope.payloadDigest) {
+    throw new VerificationSyncProtocolError(
+      'payloadDigest does not match the canonical payload.',
+      'PAYLOAD_DIGEST_MISMATCH'
+    );
+  }
+
+  return envelope;
+}
+
 function validateRecordEnvelope(envelope) {
   assertPlainObject(envelope, 'envelope');
 
@@ -183,6 +276,47 @@ function validateRecordEnvelope(envelope) {
   return envelope;
 }
 
+function buildHealthEnvelope({
+  audience,
+  epoch,
+  keyId,
+  path,
+  payload,
+  payloadDigest,
+  timestamp,
+}) {
+  const computedPayloadDigest = digestPayload(payload);
+  if (payloadDigest !== undefined && payloadDigest !== computedPayloadDigest) {
+    throw new VerificationSyncProtocolError(
+      'Provided payloadDigest does not match payload.',
+      'PAYLOAD_DIGEST_MISMATCH'
+    );
+  }
+
+  const envelope = {
+    audience,
+    domain: HEALTH_SIGNATURE_DOMAIN,
+    epoch,
+    keyId,
+    method: 'POST',
+    path,
+    payload,
+    payloadDigest: computedPayloadDigest,
+    protocolVersion: PROTOCOL_VERSION,
+    timestamp,
+  };
+
+  validateHealthEnvelope(envelope);
+  const signedPayload = canonicalize(envelope);
+  if (Buffer.byteLength(signedPayload, 'utf8') > MAX_SIGNED_PAYLOAD_BYTES) {
+    throw new VerificationSyncProtocolError(
+      'Signed payload exceeds the protocol size limit.',
+      'SIGNED_ENVELOPE_TOO_LARGE'
+    );
+  }
+  return signedPayload;
+}
+
 function buildRecordEnvelope({
   audience,
   epoch,
@@ -248,6 +382,46 @@ function requireEd25519PrivateKey(keyInput) {
   return privateKey;
 }
 
+function buildSignedHealthRequest({
+  audience,
+  epoch,
+  keyId,
+  path,
+  privateKey,
+  timestamp,
+}) {
+  const key = requireEd25519PrivateKey(privateKey);
+  const signedPayload = buildHealthEnvelope({
+    audience,
+    epoch,
+    keyId,
+    path,
+    payload: Object.freeze({ sourceLastHealthyAt: timestamp }),
+    timestamp,
+  });
+
+  const signature = sign(null, Buffer.from(signedPayload, 'utf8'), key);
+  if (signature.length !== 64) {
+    throw new VerificationSyncProtocolError(
+      'Ed25519 signing returned an invalid signature length.',
+      'INVALID_VERIFICATION_SIGNATURE'
+    );
+  }
+  const signatureBase64 = signature.toString('base64');
+
+  return Object.freeze({
+    body: signedPayload,
+    headers: Object.freeze({
+      'Content-Type': 'application/json; charset=utf-8',
+      'X-Key-Id': keyId,
+      'X-Signature': signatureBase64,
+      'X-Timestamp': String(timestamp),
+    }),
+    signature: signatureBase64,
+    signedPayload,
+  });
+}
+
 function buildSignedRecordRequest({
   audience,
   keyId,
@@ -293,16 +467,23 @@ function buildSignedRecordRequest({
 }
 
 module.exports = {
+  HEALTH_PAYLOAD_FIELDS,
+  HEALTH_SIGNATURE_DOMAIN,
+  HEALTH_SYNC_FIELDS,
   MAX_SIGNED_PAYLOAD_BYTES,
   PROTOCOL_VERSION,
   RECORD_SYNC_FIELDS,
   SIGNATURE_DOMAIN,
   VerificationSyncProtocolError,
+  buildHealthEnvelope,
   buildRecordEnvelope,
+  buildSignedHealthRequest,
   buildSignedRecordRequest,
   canonicalize,
   digestPayload,
   requireEd25519PrivateKey,
   sha256Hex,
+  validateHealthEnvelope,
+  validateHealthPayload,
   validateRecordEnvelope,
 };

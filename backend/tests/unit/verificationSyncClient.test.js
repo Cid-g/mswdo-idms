@@ -7,7 +7,9 @@ const {
 } = require('node:crypto');
 
 const {
+  buildHealthEnvelope,
   buildRecordEnvelope,
+  buildSignedHealthRequest,
   buildSignedRecordRequest,
   digestPayload,
   requireEd25519PrivateKey,
@@ -19,6 +21,7 @@ const {
   parseSyncOrigin,
 } = require('../../src/services/verificationSyncClient');
 const {
+  verifyHealthSyncRequest,
   verifyRecordSyncRequest,
 } = require('../../../verification-app/src/crypto/signatureVerifier');
 
@@ -62,6 +65,8 @@ function operation(overrides = {}) {
 function config(overrides = {}) {
   return {
     audience: 'mswdo-verification-service',
+    healthPath: '/internal/health',
+    healthUrl: 'https://verify.example.test/internal/health',
     keyId: 'office-key-2026-01',
     origin: 'https://verify.example.test',
     privateKey,
@@ -138,6 +143,53 @@ describe('verification sync protocol compatibility', () => {
     expect(verified.envelope.revision).toBe(7);
     expect(verified.envelope.tokenHash).toBe(TOKEN_HASH);
     expect(request.headers['Content-Type']).toBe('application/json; charset=utf-8');
+  });
+
+  test('builds the exact Phase 2A canonical health envelope', () => {
+    expect(buildHealthEnvelope({
+      audience: 'mswdo-verification-service',
+      epoch: 1,
+      keyId: 'office-key-2026-01',
+      path: '/internal/health',
+      payload: { sourceLastHealthyAt: TIMESTAMP },
+      timestamp: TIMESTAMP,
+    })).toBe(
+      '{"audience":"mswdo-verification-service","domain":"MSWDO-IDMS/VERIFY-HEALTH/V1",'
+      + '"epoch":1,"keyId":"office-key-2026-01","method":"POST","path":"/internal/health",'
+      + '"payload":{"sourceLastHealthyAt":1785978000123},"payloadDigest":'
+      + '"69ccd2547c33cb272862902a685ddab27154624d457bb6852bd99ef91be5ac92",'
+      + '"protocolVersion":1,"timestamp":1785978000123}'
+    );
+  });
+
+  test('produces health bytes and headers accepted by the Phase 2A verifier', () => {
+    const request = buildSignedHealthRequest({
+      audience: 'mswdo-verification-service',
+      epoch: 1,
+      keyId: 'office-key-2026-01',
+      path: '/internal/health',
+      privateKey,
+      timestamp: TIMESTAMP,
+    });
+
+    const verified = verifyHealthSyncRequest({
+      audience: 'mswdo-verification-service',
+      headerKeyId: request.headers['X-Key-Id'],
+      headerTimestamp: request.headers['X-Timestamp'],
+      maxClockSkewMs: 300_000,
+      method: 'POST',
+      now: TIMESTAMP,
+      path: '/internal/health',
+      publicKeys: { 'office-key-2026-01': publicKey },
+      signatureBase64: request.headers['X-Signature'],
+      signedPayload: request.body,
+    });
+
+    expect(verified.envelope).toMatchObject({
+      epoch: 1,
+      payload: { sourceLastHealthyAt: TIMESTAMP },
+      timestamp: TIMESTAMP,
+    });
   });
 
   test('signs only minimized outbox fields and never operation metadata or raw QR data', () => {
@@ -247,6 +299,16 @@ describe('verification sync configuration', () => {
     }, { readFile: () => privatePem })).toThrow(/KEY_ID/);
   });
 
+  test('requires distinct record and source-health paths', () => {
+    expect(() => loadVerificationSyncConfig({
+      VERIFICATION_SYNC_ORIGIN: 'https://verify.example.test',
+      VERIFICATION_SYNC_KEY_ID: 'office-key-1',
+      VERIFICATION_SYNC_PRIVATE_KEY_PATH: path.resolve('private.pem'),
+      VERIFY_HEALTH_PATH: '/same',
+      VERIFY_SYNC_PATH: '/same',
+    }, { readFile: () => privatePem })).toThrow(/must differ/);
+  });
+
   test('fails closed when the private key is missing, public, or non-Ed25519', () => {
     const base = {
       VERIFICATION_SYNC_ORIGIN: 'https://verify.example.test',
@@ -267,6 +329,64 @@ describe('verification sync configuration', () => {
 });
 
 describe('verification sync HTTP client', () => {
+  test.each([
+    [201, 'INSERTED', true],
+    [200, 'UPDATED', true],
+    [200, 'IDEMPOTENT', false],
+  ])('accepts a matching source-health %s acknowledgement', async (status, outcome, applied) => {
+    const fetchImpl = jest.fn(async () => response(status, {
+      applied,
+      epoch: 1,
+      outcome,
+      sourceLastHealthyAt: new Date(TIMESTAMP).toISOString(),
+    }));
+    const client = createVerificationSyncClient({
+      config: config(),
+      fetchImpl,
+      now: () => TIMESTAMP + 99,
+    });
+
+    await expect(client.sendHealth({ epoch: 1, sourceLastHealthyAt: TIMESTAMP }))
+      .resolves.toEqual({
+        applied,
+        epoch: 1,
+        outcome,
+        sourceLastHealthyAt: new Date(TIMESTAMP).toISOString(),
+      });
+
+    const [url, request] = fetchImpl.mock.calls[0];
+    expect(url).toBe('https://verify.example.test/internal/health');
+    expect(request.headers['X-Timestamp']).toBe(String(TIMESTAMP));
+    expect(JSON.parse(request.body).payload).toEqual({ sourceLastHealthyAt: TIMESTAMP });
+  });
+
+  test('rejects a heartbeat timestamp outside the JavaScript Date range', async () => {
+    const client = createVerificationSyncClient({
+      config: config(),
+      fetchImpl: jest.fn(),
+    });
+
+    await expect(client.sendHealth({
+      epoch: 1,
+      sourceLastHealthyAt: Number.MAX_SAFE_INTEGER,
+    })).rejects.toThrow('valid positive Unix timestamp');
+  });
+
+  test('rejects a source-health acknowledgement that changes the signed instant', async () => {
+    const client = createVerificationSyncClient({
+      config: config(),
+      fetchImpl: async () => response(200, {
+        applied: true,
+        epoch: 1,
+        outcome: 'UPDATED',
+        sourceLastHealthyAt: new Date(TIMESTAMP + 1).toISOString(),
+      }),
+    });
+
+    await expect(client.sendHealth({ epoch: 1, sourceLastHealthyAt: TIMESTAMP }))
+      .rejects.toMatchObject({ code: 'VERIFY_HEALTH_ACK_MISMATCH', retryable: true });
+  });
+
   test.each([
     [201, 'INSERTED', true],
     [200, 'UPDATED', true],

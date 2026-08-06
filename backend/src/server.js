@@ -25,11 +25,17 @@ const {
   startVerificationOutboxWorker,
   stopVerificationOutboxWorker,
 } = require('./workers/verificationOutboxWorker');
+const {
+  startVerificationHeartbeatWorker,
+  stopVerificationHeartbeatWorker,
+} = require('./workers/verificationHeartbeatWorker');
 
 const PORT = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/mswdo_idms';
 const DEFAULT_VERIFICATION_WORKER_INTERVAL_MS = 30_000;
 const MAX_VERIFICATION_WORKER_INTERVAL_MS = 60 * 60 * 1000;
+const DEFAULT_VERIFICATION_HEARTBEAT_INTERVAL_MS = 60_000;
+const MAX_VERIFICATION_HEARTBEAT_INTERVAL_MS = 5 * 60_000;
 
 function verificationConfigError(message, code = 'INVALID_VERIFICATION_SYNC_CONFIG') {
   return new VerificationSyncConfigError(message, code);
@@ -68,6 +74,31 @@ function parseVerificationWorkerInterval(value) {
   return parsed;
 }
 
+function parseVerificationHeartbeatInterval(value) {
+  if (value === undefined || value === '') {
+    return DEFAULT_VERIFICATION_HEARTBEAT_INTERVAL_MS;
+  }
+  const parsed = Number(value);
+  if (
+    !Number.isSafeInteger(parsed)
+    || parsed < 1_000
+    || parsed > MAX_VERIFICATION_HEARTBEAT_INTERVAL_MS
+  ) {
+    throw verificationConfigError(
+      `VERIFICATION_HEARTBEAT_INTERVAL_MS must be an integer from 1000 to ${MAX_VERIFICATION_HEARTBEAT_INTERVAL_MS}.`
+    );
+  }
+  return parsed;
+}
+
+function parseVerificationEpoch(value) {
+  const parsed = Number(value === undefined || value === '' ? '1' : value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw verificationConfigError('VERIFY_EPOCH must be a positive safe integer.');
+  }
+  return parsed;
+}
+
 function loadVerificationWorkerConfig(env = process.env, {
   syncConfigLoader = loadVerificationSyncConfig,
 } = {}) {
@@ -84,6 +115,10 @@ function loadVerificationWorkerConfig(env = process.env, {
   return Object.freeze({
     clientConfig: syncConfigLoader(env),
     enabled: true,
+    epoch: parseVerificationEpoch(env.VERIFY_EPOCH),
+    heartbeatIntervalMs: parseVerificationHeartbeatInterval(
+      env.VERIFICATION_HEARTBEAT_INTERVAL_MS
+    ),
     intervalMs: parseVerificationWorkerInterval(
       env.VERIFICATION_SYNC_WORKER_INTERVAL_MS
     ),
@@ -137,6 +172,8 @@ function createServerLifecycle({
   verificationClientFactory = createVerificationSyncClient,
   verificationWorkerStarter = startVerificationOutboxWorker,
   verificationWorkerStopper = stopVerificationOutboxWorker,
+  verificationHeartbeatStarter = startVerificationHeartbeatWorker,
+  verificationHeartbeatStopper = stopVerificationHeartbeatWorker,
   logger = console,
 } = {}) {
   let httpServer = null;
@@ -147,6 +184,7 @@ function createServerLifecycle({
   let outboxStarted = false;
   let expiryStarted = false;
   let verificationWorkerStarted = false;
+  let verificationHeartbeatStarted = false;
   let resourcesStopPromise = null;
 
   function attemptFabricConnection() {
@@ -207,8 +245,9 @@ function createServerLifecycle({
       };
 
       // All schedulers must be fully idle before the HTTP/Fabric/Mongo layers
-      // are closed. This prevents in-flight expiry, Fabric settlement, or
-      // verification delivery from losing its database connection on shutdown.
+      // are closed. This prevents in-flight expiry, Fabric settlement,
+      // verification delivery, or health reporting from losing its database
+      // connection during shutdown.
       await Promise.all([
         capture(async () => {
           if (outboxStarted) await outboxStopper();
@@ -221,6 +260,10 @@ function createServerLifecycle({
         capture(async () => {
           if (verificationWorkerStarted) await verificationWorkerStopper();
           verificationWorkerStarted = false;
+        }),
+        capture(async () => {
+          if (verificationHeartbeatStarted) await verificationHeartbeatStopper();
+          verificationHeartbeatStarted = false;
         }),
       ]);
 
@@ -284,7 +327,13 @@ function createServerLifecycle({
             syncClient: verificationSyncClient,
           });
           verificationWorkerStarted = true;
-          logger.log('[Verification Sync] Outbound sender enabled');
+          verificationHeartbeatStarter({
+            epoch: verificationWorkerConfig.epoch,
+            intervalMs: verificationWorkerConfig.heartbeatIntervalMs,
+            syncClient: verificationSyncClient,
+          });
+          verificationHeartbeatStarted = true;
+          logger.log('[Verification Sync] Outbound sender and source heartbeat enabled');
         } else {
           logger.log('[Verification Sync] Outbound sender disabled');
         }
@@ -362,7 +411,9 @@ if (require.main === module) {
 }
 
 module.exports = {
+  DEFAULT_VERIFICATION_HEARTBEAT_INTERVAL_MS,
   DEFAULT_VERIFICATION_WORKER_INTERVAL_MS,
+  MAX_VERIFICATION_HEARTBEAT_INTERVAL_MS,
   MAX_VERIFICATION_WORKER_INTERVAL_MS,
   createServerLifecycle,
   dropLegacyIndex,

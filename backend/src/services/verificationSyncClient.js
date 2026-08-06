@@ -5,11 +5,13 @@ const path = require('node:path');
 const { TextDecoder } = require('node:util');
 
 const {
+  buildSignedHealthRequest,
   buildSignedRecordRequest,
   requireEd25519PrivateKey,
 } = require('../lib/verificationSyncProtocol');
 
 const DEFAULT_PROTOCOL_AUDIENCE = 'mswdo-verification-service';
+const DEFAULT_HEALTH_PATH = '/internal/health';
 const DEFAULT_SYNC_PATH = '/internal/sync';
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_RESPONSE_BYTES = 16 * 1024;
@@ -171,6 +173,16 @@ function loadVerificationSyncConfig(env = process.env, {
     DEFAULT_SYNC_PATH,
     'VERIFY_SYNC_PATH'
   );
+  const healthPath = parseAbsolutePath(
+    env.VERIFY_HEALTH_PATH,
+    DEFAULT_HEALTH_PATH,
+    'VERIFY_HEALTH_PATH'
+  );
+  if (healthPath === syncPath) {
+    throw new VerificationSyncConfigError(
+      'VERIFY_HEALTH_PATH must differ from VERIFY_SYNC_PATH.'
+    );
+  }
   const keyId = assertTrimmed(
     env.VERIFICATION_SYNC_KEY_ID,
     'VERIFICATION_SYNC_KEY_ID',
@@ -187,9 +199,12 @@ function loadVerificationSyncConfig(env = process.env, {
     readFile
   );
   const syncUrl = new URL(syncPath, `${origin}/`).toString();
+  const healthUrl = new URL(healthPath, `${origin}/`).toString();
 
   return Object.freeze({
     audience,
+    healthPath,
+    healthUrl,
     keyId,
     origin,
     privateKey,
@@ -344,6 +359,68 @@ function assertSuccessAcknowledgement(body, operation, status) {
   return Object.freeze({ ...body });
 }
 
+function assertHealthAcknowledgement(body, heartbeat, status) {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    throw new VerificationSyncTransportError(
+      'Verification health acknowledgement is malformed.',
+      'VERIFY_HEALTH_ACK_MISMATCH',
+      { retryable: true, status }
+    );
+  }
+
+  const expectedFields = ['applied', 'epoch', 'outcome', 'sourceLastHealthyAt'];
+  const fields = Object.keys(body).sort();
+  const expectedInstant = new Date(heartbeat.sourceLastHealthyAt).toISOString();
+  if (
+    fields.length !== expectedFields.length
+    || fields.some((field, index) => field !== expectedFields[index])
+    || typeof body.applied !== 'boolean'
+    || !SUCCESS_OUTCOMES.includes(body.outcome)
+    || body.epoch !== heartbeat.epoch
+    || body.sourceLastHealthyAt !== expectedInstant
+  ) {
+    throw new VerificationSyncTransportError(
+      'Verification health acknowledgement does not match the signed heartbeat.',
+      'VERIFY_HEALTH_ACK_MISMATCH',
+      { retryable: true, status }
+    );
+  }
+
+  const expectedApplied = body.outcome !== 'IDEMPOTENT';
+  const expectedStatus = body.outcome === 'INSERTED' ? 201 : 200;
+  if (body.applied !== expectedApplied || status !== expectedStatus) {
+    throw new VerificationSyncTransportError(
+      'Verification health acknowledgement outcome is inconsistent.',
+      'VERIFY_HEALTH_ACK_MISMATCH',
+      { retryable: true, status }
+    );
+  }
+
+  return Object.freeze({ ...body });
+}
+
+function plainHeartbeat(heartbeat) {
+  if (!heartbeat || typeof heartbeat !== 'object') {
+    throw new TypeError('Verification heartbeat is required.');
+  }
+  if (!Number.isSafeInteger(heartbeat.epoch) || heartbeat.epoch < 1) {
+    throw new TypeError('Verification heartbeat epoch must be a positive safe integer.');
+  }
+  if (
+    !Number.isSafeInteger(heartbeat.sourceLastHealthyAt)
+    || heartbeat.sourceLastHealthyAt < 1
+    || Number.isNaN(new Date(heartbeat.sourceLastHealthyAt).getTime())
+  ) {
+    throw new TypeError(
+      'Verification heartbeat sourceLastHealthyAt must be a valid positive Unix timestamp.'
+    );
+  }
+  return {
+    epoch: heartbeat.epoch,
+    sourceLastHealthyAt: heartbeat.sourceLastHealthyAt,
+  };
+}
+
 function plainOperation(operation) {
   if (!operation || typeof operation !== 'object') {
     throw new TypeError('Verification sync operation is required.');
@@ -364,6 +441,10 @@ function validateClientConfig(config) {
 
   const origin = parseSyncOrigin(config.origin);
   const syncPath = parseAbsolutePath(config.syncPath, DEFAULT_SYNC_PATH, 'syncPath');
+  const healthPath = parseAbsolutePath(config.healthPath, DEFAULT_HEALTH_PATH, 'healthPath');
+  if (healthPath === syncPath) {
+    throw new VerificationSyncConfigError('healthPath must differ from syncPath.');
+  }
   const keyId = assertTrimmed(config.keyId, 'keyId', {
     max: 64,
     pattern: KEY_ID_PATTERN,
@@ -378,6 +459,12 @@ function validateClientConfig(config) {
   if (config.syncUrl !== expectedSyncUrl) {
     throw new VerificationSyncConfigError(
       'syncUrl must exactly match origin plus syncPath.'
+    );
+  }
+  const expectedHealthUrl = new URL(healthPath, `${origin}/`).toString();
+  if (config.healthUrl !== expectedHealthUrl) {
+    throw new VerificationSyncConfigError(
+      'healthUrl must exactly match origin plus healthPath.'
     );
   }
 
@@ -398,6 +485,67 @@ function createVerificationSyncClient({
   if (typeof now !== 'function') throw new TypeError('now must be a function.');
   if (typeof setTimeoutImpl !== 'function' || typeof clearTimeoutImpl !== 'function') {
     throw new TypeError('Timer functions are required.');
+  }
+
+  async function sendHealth(heartbeat) {
+    const command = plainHeartbeat(heartbeat);
+    const request = buildSignedHealthRequest({
+      audience: config.audience,
+      epoch: command.epoch,
+      keyId: config.keyId,
+      path: config.healthPath,
+      privateKey: config.privateKey,
+      timestamp: command.sourceLastHealthyAt,
+    });
+
+    const controller = new AbortController();
+    const timeout = setTimeoutImpl(() => controller.abort(), config.timeoutMs);
+    if (typeof timeout?.unref === 'function') timeout.unref();
+
+    let response;
+    try {
+      response = await fetchImpl(config.healthUrl, {
+        body: request.body,
+        cache: 'no-store',
+        headers: request.headers,
+        method: 'POST',
+        redirect: 'error',
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new VerificationSyncTransportError(
+          'Verification health request timed out.',
+          'VERIFY_HEALTH_TIMEOUT',
+          { cause: error, retryable: true }
+        );
+      }
+      throw new VerificationSyncTransportError(
+        'Verification health service is unavailable.',
+        'VERIFY_HEALTH_UNAVAILABLE',
+        { cause: error, retryable: true }
+      );
+    } finally {
+      clearTimeoutImpl(timeout);
+    }
+
+    const body = await readBoundedResponse(response);
+    if (response.status !== 200 && response.status !== 201) {
+      const status = Number.isSafeInteger(response.status) ? response.status : null;
+      const code = remoteErrorCode(body);
+      throw new VerificationSyncTransportError(
+        `Verification health request was rejected${status ? ` with HTTP ${status}` : ''}.`,
+        'VERIFY_HEALTH_REJECTED',
+        {
+          remoteCode: code,
+          retryable: status === null || status === 408 || status === 425
+            || status === 429 || status >= 500,
+          status,
+        }
+      );
+    }
+
+    return assertHealthAcknowledgement(body, command, response.status);
   }
 
   async function sendRecord(operation) {
@@ -466,16 +614,18 @@ function createVerificationSyncClient({
     return assertSuccessAcknowledgement(body, command, response.status);
   }
 
-  return Object.freeze({ sendRecord });
+  return Object.freeze({ sendHealth, sendRecord });
 }
 
 module.exports = {
+  DEFAULT_HEALTH_PATH,
   DEFAULT_PROTOCOL_AUDIENCE,
   DEFAULT_SYNC_PATH,
   DEFAULT_TIMEOUT_MS,
   MAX_RESPONSE_BYTES,
   VerificationSyncConfigError,
   VerificationSyncTransportError,
+  assertHealthAcknowledgement,
   assertSuccessAcknowledgement,
   createVerificationSyncClient,
   loadVerificationSyncConfig,
